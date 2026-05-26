@@ -1,0 +1,19 @@
+# Human-readable configuration reference. The current runner uses argparse defaults.
+# Keep this file as documentation for productionizing the pipeline later.
+raw_files:
+  incident: INCIDENT_VIEW.csv
+  injury: INCIDENTINJURY_VIEW.csv
+  listitem: LISTITEM_VIEW.csv
+  location: LOCATION_VIEW.csv
+  task: TASK_VIEW.csv
+  audit: AUDIT_VIEW.csv
+pattern_categories:
+  - Near Miss
+  - Hazard Identification
+severe_actual_rule:
+  any_of:
+    - fatality_any
+    - lost_time_any
+    - restricted_time_any
+    - inpatient_any
+recommended_text_field_for_first_model: ml_text_early
