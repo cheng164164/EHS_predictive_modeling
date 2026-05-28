@@ -62,7 +62,7 @@ TARGET_TYPE = "any_injury"
 #   "both"          -> train baseline and with_clusters for comparison
 #   "experiments"   -> baseline + small experiment matrix below
 #   "all"           -> baseline, with_clusters, and experiment matrix
-FEATURE_SET = "with_clusters"
+FEATURE_SET = "baseline"
 
 # Future prediction horizon. 3 months is the recommended MVP horizon.
 HORIZON_MONTHS = 3

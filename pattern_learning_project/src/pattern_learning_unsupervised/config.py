@@ -138,7 +138,7 @@ CLUSTER_SELECTION_METHOD = "eom"
 #   - returns smaller, more fine-grained clusters
 #   - useful when detailed subtopics are desired
 
-CLUSTER_SELECTION_EPSILON = 0.1
+CLUSTER_SELECTION_EPSILON = 0.15
 # Distance threshold for merging nearby clusters.
 # Larger values:
 #   - merge more clusters together

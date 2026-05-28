@@ -537,17 +537,20 @@ def calibrate_thresholds(matrix, records: pd.DataFrame) -> dict:
     }
 
 
-def match_band(score: float, thresholds: dict) -> str:
-    """Assign a readable match band from a numeric similarity score.
-    
-    Bands are ordered from strongest to weakest:
-    - strong_match
-    - possible_match
-    - weak_match
-    - no_match
-    
-    These labels are easier for EHS reviewers and downstream dashboards than raw
-    cosine scores alone.
+def raw_match_band(score: float, thresholds: dict) -> str:
+    """Assign the calibrated diagnostic band from the numeric similarity score.
+
+    This function uses the three calibrated thresholds exactly as stored in
+    thresholds.json:
+    - strong_match_threshold
+    - possible_match_threshold
+    - weak_match_threshold
+
+    The result is useful for diagnostics because it shows whether a record has
+    weak, possible, or strong evidence relative to the calibration distributions.
+    However, weak_match can be too permissive for user-facing output. The
+    user-facing band is therefore produced by match_band(), which applies the
+    configurable return policy in config.RETURN_MATCH_MIN_BAND.
     """
     if score is None or pd.isna(score):
         return "no_match"
@@ -558,6 +561,70 @@ def match_band(score: float, thresholds: dict) -> str:
     if score >= thresholds["weak_match_threshold"]:
         return "weak_match"
     return "no_match"
+
+
+def get_return_match_threshold(thresholds: dict) -> float:
+    """Return the minimum score needed to show a user-facing match.
+
+    This is the key update for the no-match issue. The calibrated weak threshold
+    can be very low, so using it as the display threshold can make nearly every
+    query look like it has a match. This function separates:
+
+    - diagnostic calibration: weak / possible / strong thresholds
+    - business display policy: minimum threshold to actually return matches
+
+    Default behavior is controlled in config.py:
+        RETURN_MATCH_MIN_BAND = "possible_match"
+
+    With that default, records below possible_match_threshold are shown as
+    no_match in the output summary, even if their raw diagnostic band is
+    weak_match.
+    """
+    override = getattr(config, "RETURN_MATCH_MIN_SCORE", None)
+    if override is not None:
+        return float(override)
+
+    min_band = str(getattr(config, "RETURN_MATCH_MIN_BAND", "possible_match")).strip().lower()
+    if min_band == "strong_match":
+        return float(thresholds["strong_match_threshold"])
+    if min_band == "possible_match":
+        return float(thresholds["possible_match_threshold"])
+    if min_band == "weak_match":
+        return float(thresholds["weak_match_threshold"])
+    raise ValueError(
+        "Invalid RETURN_MATCH_MIN_BAND. Expected 'weak_match', 'possible_match', or 'strong_match'. "
+        f"Got: {min_band!r}"
+    )
+
+
+def is_returnable_match(score: float, thresholds: dict) -> bool:
+    """Return True when a score is high enough to show historical matches.
+
+    If False, the query remains in the query-summary file but is labeled no_match
+    and its individual top-match rows are suppressed in prediction outputs.
+    """
+    if score is None or pd.isna(score):
+        return False
+    return float(score) >= get_return_match_threshold(thresholds)
+
+
+def match_band(score: float, thresholds: dict) -> str:
+    """Assign the user-facing match band after applying the return policy.
+
+    This is the band written to similarity_band in output files. It intentionally
+    may differ from raw_similarity_band. For example, when
+    RETURN_MATCH_MIN_BAND = "possible_match":
+
+        raw_similarity_band = weak_match
+        similarity_band     = no_match
+
+    This makes no_match behavior more realistic and prevents weak diagnostic
+    matches from being displayed as useful historical injury analogs.
+    """
+    raw_band = raw_match_band(score, thresholds)
+    if not is_returnable_match(score, thresholds):
+        return "no_match"
+    return raw_band
 
 
 def preview(text: object, n: int = 300) -> str:
@@ -598,7 +665,10 @@ def retrieve(query_records: pd.DataFrame, query_matrix, reference_records: pd.Da
     for qpos, qrow in query_records.reset_index(drop=True).iterrows():
         sims = 1.0 - distances[qpos]
         top1 = float(sims[0]) if len(sims) else np.nan
+        raw_band = raw_match_band(top1, thresholds)
         band = match_band(top1, thresholds)
+        returnable_scores = [float(s) for s in sims if is_returnable_match(float(s), thresholds)]
+        returned_match_count = len(returnable_scores)
         qid = qrow.get("incident_id", qrow.get("_query_row_id", qpos))
         summary_rows.append({
             "query_row_id": int(qrow.get("_query_row_id", qpos)),
@@ -610,16 +680,27 @@ def retrieve(query_records: pd.DataFrame, query_matrix, reference_records: pd.Da
             "query_department_name_filled": qrow.get("department_name_filled", pd.NA),
             "query_title": qrow.get("title", pd.NA),
             "top1_similarity_score": top1,
+            "raw_similarity_band": raw_band,
             "similarity_band": band,
-            "returned_match_count": 0 if band == "no_match" else int(n_neighbors),
+            "return_match_threshold": get_return_match_threshold(thresholds),
+            "returned_match_count": int(returned_match_count) if band != "no_match" else 0,
             "query_text_preview": preview(qrow.get("_ml_text", "")),
+            # The next fields are normally blank during production prediction.
+            # They are populated by temporal validation and no-match control
+            # validation so reviewers can separate true holdout injury queries
+            # from negative-control queries in the same output file.
+            "query_validation_role": qrow.get("_validation_role", pd.NA),
+            "query_expected_similarity_band": qrow.get("_expected_similarity_band", pd.NA),
+            "query_control_source": qrow.get("_control_source", pd.NA),
         })
         if band == "no_match" and not include_no_match_rows:
             continue
         for rank, (score, ridx) in enumerate(zip(sims, indices[qpos]), start=1):
             ref = reference_records.iloc[int(ridx)]
             score = float(score)
-            if not include_no_match_rows and score < thresholds["weak_match_threshold"]:
+            raw_score_band = raw_match_band(score, thresholds)
+            score_band = match_band(score, thresholds)
+            if not include_no_match_rows and not is_returnable_match(score, thresholds):
                 continue
             match_rows.append({
                 "query_row_id": int(qrow.get("_query_row_id", qpos)),
@@ -631,9 +712,14 @@ def retrieve(query_records: pd.DataFrame, query_matrix, reference_records: pd.Da
                 "query_department_name_filled": qrow.get("department_name_filled", pd.NA),
                 "query_severe_actual": qrow.get("severe_actual", pd.NA),
                 "query_title": qrow.get("title", pd.NA),
+                "query_validation_role": qrow.get("_validation_role", pd.NA),
+                "query_expected_similarity_band": qrow.get("_expected_similarity_band", pd.NA),
+                "query_control_source": qrow.get("_control_source", pd.NA),
                 "rank": rank,
                 "similarity_score": score,
-                "similarity_band": match_band(score, thresholds),
+                "raw_similarity_band": raw_score_band,
+                "similarity_band": score_band,
+                "return_match_threshold": get_return_match_threshold(thresholds),
                 "matched_reference_row_id": int(ref.get("_reference_row_id", ridx)),
                 "matched_reference_incident_id": ref.get("incident_id", pd.NA),
                 "matched_reference_incident_number": ref.get("incident_number", pd.NA),
@@ -653,6 +739,204 @@ def retrieve(query_records: pd.DataFrame, query_matrix, reference_records: pd.Da
             })
     return pd.DataFrame(summary_rows), pd.DataFrame(match_rows)
 
+
+
+def tag_validation_queries(
+    df: pd.DataFrame,
+    role: str,
+    expected_similarity_band: str | None = None,
+    control_source: str | None = None,
+) -> pd.DataFrame:
+    """Add validation-only metadata columns to query records.
+
+    These columns do not affect the TF-IDF model. They are copied into output
+    files so reviewers can distinguish regular temporal holdout injury queries
+    from no-match control queries.
+    """
+    out = df.copy()
+    out["_validation_role"] = role
+    out["_expected_similarity_band"] = expected_similarity_band or "not_predefined"
+    out["_control_source"] = control_source or "none"
+    return out
+
+
+def make_synthetic_no_match_controls() -> pd.DataFrame:
+    """Create synthetic off-domain queries expected to return no_match.
+
+    Why synthetic controls are useful:
+    - The normal temporal holdout queries are all injury records, so most should
+      look at least weakly related to older injury history.
+    - Real non-injury EHS records can still be very relevant to past injuries
+      because near misses and hazards may describe the same mechanisms.
+    - These synthetic examples are deliberately unrelated administrative topics.
+      They prove that the retrieval pipeline can reject clearly irrelevant input.
+    """
+    rows = getattr(config, "SYNTHETIC_NO_MATCH_CONTROL_RECORDS", [])
+    if not rows:
+        return pd.DataFrame()
+    controls = pd.DataFrame(rows).copy()
+    controls["incident_number"] = controls.get("incident_number", controls["incident_id"])
+    controls["incident_date"] = controls.get("incident_date", pd.NA)
+    controls["site_name_filled"] = controls.get("site_name_filled", "Synthetic Control")
+    controls["department_name_filled"] = controls.get("department_name_filled", "Synthetic Control")
+    controls["injury_count"] = 0
+    controls["severe_actual"] = False
+    controls = add_working_columns(controls)
+    controls = controls[controls["_ml_word_count"].ge(3)].copy()
+    return tag_validation_queries(
+        controls,
+        role="no_match_control_synthetic",
+        expected_similarity_band="no_match",
+        control_source="synthetic_off_domain",
+    )
+
+
+def make_real_non_injury_no_match_controls(
+    all_records: pd.DataFrame,
+    holdout: pd.DataFrame,
+    vectorizer: TfidfVectorizer,
+    nn: NearestNeighbors,
+    train: pd.DataFrame,
+    thresholds: dict,
+    top_k: int,
+) -> pd.DataFrame:
+    """Find real non-injury records that behave like no-match controls.
+
+    Important interpretation:
+    - A non-injury incident is not automatically a negative example. Some
+      near-miss/hazard records should intentionally match historical injuries.
+    - Therefore this function does not add random non-injury records blindly.
+      It first scores a sampled pool of non-injury records against the older
+      injury reference library, then keeps only records whose user-facing band is
+      no_match after applying RETURN_MATCH_MIN_BAND.
+    - These rows are best described as "low-similarity real non-injury controls"
+      rather than true labels that every non-injury record must be no_match.
+    """
+    requested = int(getattr(config, "NO_MATCH_REAL_CONTROL_SAMPLE_SIZE", 0))
+    if requested <= 0:
+        return pd.DataFrame()
+
+    records = add_working_columns(all_records)
+    candidates = records[records["injury_count"].eq(0) & records["_ml_word_count"].ge(3)].copy()
+
+    # Prefer the same future/holdout date range when available. This keeps the
+    # no-match control validation aligned with temporal validation: older injury
+    # history is used to score newer query records.
+    if getattr(config, "NO_MATCH_REAL_CONTROLS_HOLDOUT_PERIOD_ONLY", True) and not candidates.empty:
+        if "_incident_date_dt" in candidates.columns and "_incident_date_dt" in holdout.columns:
+            start = holdout["_incident_date_dt"].min()
+            end = holdout["_incident_date_dt"].max()
+            if pd.notna(start) and pd.notna(end):
+                in_period = candidates["_incident_date_dt"].between(start, end, inclusive="both")
+                if in_period.any():
+                    candidates = candidates[in_period].copy()
+
+    if candidates.empty:
+        return pd.DataFrame()
+
+    # Score a bounded candidate pool for runtime control. The sampling is
+    # reproducible because RANDOM_SEED is fixed in config.py.
+    pool_size = int(getattr(config, "NO_MATCH_REAL_CONTROL_CANDIDATE_POOL_SIZE", 2000))
+    if len(candidates) > pool_size:
+        candidates = candidates.sample(n=pool_size, random_state=config.RANDOM_SEED).copy()
+    candidates = candidates.reset_index(drop=True)
+    candidates["_query_row_id"] = np.arange(len(candidates))
+
+    qmatrix = vectorizer.transform(candidates["_ml_text"].tolist())
+    summary, _ = retrieve(candidates, qmatrix, train, nn, thresholds, top_k=1, include_no_match_rows=True)
+    if summary.empty:
+        return pd.DataFrame()
+
+    # Keep only records that are actually labeled no_match by the user-facing
+    # return policy. Sorting by top1 score selects the clearest no-match examples
+    # first. With the recommended default RETURN_MATCH_MIN_BAND="possible_match",
+    # weak diagnostic matches are included as no_match controls.
+    summary = summary.sort_values("top1_similarity_score", ascending=True)
+    selected_ids = summary.loc[summary["similarity_band"].eq("no_match"), "query_row_id"].head(requested)
+    if selected_ids.empty:
+        return pd.DataFrame()
+
+    controls = candidates[candidates["_query_row_id"].isin(selected_ids.astype(int))].copy()
+    controls = controls.sort_values("_query_row_id").reset_index(drop=True)
+    return tag_validation_queries(
+        controls,
+        role="no_match_control_real_non_injury_low_similarity",
+        expected_similarity_band="no_match",
+        control_source="real_non_injury_low_similarity",
+    )
+
+
+def make_no_match_validation_controls(
+    all_records: pd.DataFrame,
+    holdout: pd.DataFrame,
+    vectorizer: TfidfVectorizer,
+    nn: NearestNeighbors,
+    train: pd.DataFrame,
+    thresholds: dict,
+    top_k: int,
+) -> pd.DataFrame:
+    """Build the optional no-match control query set used during validation.
+
+    The returned rows are additional validation queries only. They are never used
+    to fit the vectorizer, nearest-neighbor index, or thresholds.
+    """
+    if not getattr(config, "ENABLE_NO_MATCH_VALIDATION_CONTROLS", True):
+        return pd.DataFrame()
+
+    parts = [make_synthetic_no_match_controls()]
+    real_controls = make_real_non_injury_no_match_controls(
+        all_records=all_records,
+        holdout=holdout,
+        vectorizer=vectorizer,
+        nn=nn,
+        train=train,
+        thresholds=thresholds,
+        top_k=top_k,
+    )
+    parts.append(real_controls)
+    parts = [p for p in parts if p is not None and not p.empty]
+    return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
+
+
+def no_match_control_metrics(control_summary: pd.DataFrame) -> dict:
+    """Summarize whether negative controls were correctly classified as no_match."""
+    if control_summary.empty:
+        return {
+            "n_no_match_control_records": 0,
+            "no_match_control_note": "No no-match controls were generated. Check config settings or data availability.",
+        }
+
+    out = {
+        "n_no_match_control_records": int(len(control_summary)),
+        "no_match_control_band_counts": {
+            str(k): int(v) for k, v in control_summary["similarity_band"].value_counts(dropna=False).to_dict().items()
+        },
+        "no_match_control_raw_band_counts": (
+            {str(k): int(v) for k, v in control_summary["raw_similarity_band"].value_counts(dropna=False).to_dict().items()}
+            if "raw_similarity_band" in control_summary.columns else {}
+        ),
+        "return_match_min_band": str(getattr(config, "RETURN_MATCH_MIN_BAND", "possible_match")),
+        "no_match_control_no_match_rate": float(control_summary["similarity_band"].eq("no_match").mean()),
+        "no_match_control_unexpected_match_count": int(control_summary["similarity_band"].ne("no_match").sum()),
+        "no_match_control_top1_similarity_mean": float(pd.to_numeric(control_summary["top1_similarity_score"], errors="coerce").mean()),
+        "no_match_control_top1_similarity_max": float(pd.to_numeric(control_summary["top1_similarity_score"], errors="coerce").max()),
+        "no_match_control_interpretation": (
+            "These controls are a sanity check for rejection behavior. Synthetic controls should be no_match. "
+            "Real non-injury controls are selected only when their user-facing similarity_band is no_match after applying RETURN_MATCH_MIN_BAND; random non-injury records should not automatically be expected to be no_match."
+        ),
+    }
+
+    if "query_control_source" in control_summary.columns:
+        by_source = {}
+        for source, group in control_summary.groupby("query_control_source", dropna=False):
+            by_source[str(source)] = {
+                "count": int(len(group)),
+                "no_match_rate": float(group["similarity_band"].eq("no_match").mean()),
+                "raw_band_counts": ({str(k): int(v) for k, v in group["raw_similarity_band"].value_counts(dropna=False).to_dict().items()} if "raw_similarity_band" in group.columns else {}),
+                "max_top1_similarity": float(pd.to_numeric(group["top1_similarity_score"], errors="coerce").max()),
+            }
+        out["no_match_control_by_source"] = by_source
+    return out
 
 def save_model(model_dir: Path, vectorizer, nn, matrix, ref: pd.DataFrame, thresholds: dict, metadata: dict) -> None:
     """Persist all artifacts needed to reuse a fitted retrieval model.
@@ -780,7 +1064,16 @@ def validation_metrics(train: pd.DataFrame, holdout: pd.DataFrame, summary: pd.D
     }
     if not summary.empty:
         metrics["match_band_counts"] = {str(k): int(v) for k, v in summary["similarity_band"].value_counts(dropna=False).to_dict().items()}
+        if "raw_similarity_band" in summary.columns:
+            metrics["raw_match_band_counts"] = {str(k): int(v) for k, v in summary["raw_similarity_band"].value_counts(dropna=False).to_dict().items()}
+        metrics["return_match_min_band"] = str(getattr(config, "RETURN_MATCH_MIN_BAND", "possible_match"))
+        metrics["return_match_threshold"] = float(get_return_match_threshold(thresholds))
         metrics["strong_or_possible_match_rate"] = float(summary["similarity_band"].isin(["strong_match", "possible_match"]).mean())
+        metrics["returnable_match_rate"] = float(summary["similarity_band"].ne("no_match").mean())
+        metrics["no_match_rate"] = float(summary["similarity_band"].eq("no_match").mean())
+        # Kept for backward compatibility with earlier output schema. With the
+        # updated return policy, this now means user-facing weak-or-better, not
+        # raw diagnostic weak-or-better.
         metrics["weak_or_better_match_rate"] = float(summary["similarity_band"].ne("no_match").mean())
     if not top1.empty and "query_severe_actual" in top1.columns:
         qsev = to_bool(top1["query_severe_actual"])
@@ -815,8 +1108,16 @@ def run_temporal_validation(top_k: int = config.DEFAULT_TOP_K) -> dict:
     This function intentionally does not create the final production model.
     """
     validation_dir = ensure_dir(config.get_validation_dir())
-    ref = make_reference_records(load_all_records())
+    all_records = load_all_records()
+    ref = make_reference_records(all_records)
     train, holdout, split_info = make_temporal_split(ref)
+    holdout = tag_validation_queries(
+        holdout,
+        role="holdout_injury",
+        expected_similarity_band="not_predefined",
+        control_source="temporal_holdout_injury",
+    )
+    holdout["_query_row_id"] = np.arange(len(holdout))
     # Fit only on the older train/reference split. This is the key anti-leakage
     # step: the held-out newer records must not influence the vocabulary, IDF
     # weights, nearest-neighbor library, or thresholds.
@@ -833,11 +1134,66 @@ def run_temporal_validation(top_k: int = config.DEFAULT_TOP_K) -> dict:
 
     # Calibrate thresholds using only train/reference records.
     thresholds = calibrate_thresholds(train_matrix, train)
+
+    # Injury-only validation. These files preserve the original validation logic:
+    # newer held-out injury records are compared against older historical injury
+    # records.
     summary, matches = retrieve(holdout, holdout_matrix, train, nn, thresholds, top_k, include_no_match_rows=True)
     metrics = validation_metrics(train, holdout, summary, matches, thresholds, split_info)
+
+    # Optional no-match controls. These records are additional validation queries;
+    # they are not used to fit the vectorizer, NN index, or thresholds.
+    controls = make_no_match_validation_controls(
+        all_records=all_records,
+        holdout=holdout,
+        vectorizer=vectorizer,
+        nn=nn,
+        train=train,
+        thresholds=thresholds,
+        top_k=top_k,
+    )
+    if not controls.empty:
+        controls = controls.copy().reset_index(drop=True)
+        controls["_query_row_id"] = np.arange(len(holdout), len(holdout) + len(controls))
+        control_matrix = vectorizer.transform(controls["_ml_text"].tolist())
+        control_summary, control_matches = retrieve(
+            controls,
+            control_matrix,
+            train,
+            nn,
+            thresholds,
+            top_k,
+            include_no_match_rows=True,
+        )
+    else:
+        control_summary, control_matches = pd.DataFrame(), pd.DataFrame()
+
+    control_metrics = no_match_control_metrics(control_summary)
+    metrics["no_match_control_metrics"] = control_metrics
+
+    # Combined files are useful for demos/slides because they show both normal
+    # injury holdout behavior and explicit no_match examples in one validation
+    # output. The original injury-only files are still written separately.
+    summary_with_controls = pd.concat([summary, control_summary], ignore_index=True, sort=False)
+    matches_with_controls = pd.concat([matches, control_matches], ignore_index=True, sort=False)
+    if not summary_with_controls.empty:
+        metrics["combined_validation_with_controls_match_band_counts"] = {
+            str(k): int(v) for k, v in summary_with_controls["similarity_band"].value_counts(dropna=False).to_dict().items()
+        }
+        if "raw_similarity_band" in summary_with_controls.columns:
+            metrics["combined_validation_with_controls_raw_match_band_counts"] = {
+                str(k): int(v) for k, v in summary_with_controls["raw_similarity_band"].value_counts(dropna=False).to_dict().items()
+            }
+        metrics["combined_validation_with_controls_no_match_count"] = int(summary_with_controls["similarity_band"].eq("no_match").sum())
+
     summary.to_csv(validation_dir / "temporal_holdout_query_summary.csv", index=False)
     matches.to_csv(validation_dir / "temporal_holdout_top_matches.csv", index=False)
+    control_summary.to_csv(validation_dir / "no_match_control_query_summary.csv", index=False)
+    control_matches.to_csv(validation_dir / "no_match_control_top_matches.csv", index=False)
+    summary_with_controls.to_csv(validation_dir / "temporal_holdout_query_summary_with_no_match_controls.csv", index=False)
+    matches_with_controls.to_csv(validation_dir / "temporal_holdout_top_matches_with_no_match_controls.csv", index=False)
     save_json(metrics, validation_dir / "temporal_validation_metrics.json")
+    save_json(control_metrics, validation_dir / "no_match_control_metrics.json")
     save_json(thresholds, validation_dir / "thresholds_from_train_split.json")
     save_model(
         validation_dir / "model_train_split",
@@ -915,16 +1271,21 @@ def predict_injury_similarity(top_k: int = config.DEFAULT_TOP_K) -> dict:
     summary.to_csv(prediction_dir / "injury_similarity_query_summary.csv", index=False)
     matches.to_csv(prediction_dir / "injury_similarity_top_matches.csv", index=False)
     band_counts = summary["similarity_band"].value_counts(dropna=False).to_dict() if not summary.empty else {}
+    raw_band_counts = summary["raw_similarity_band"].value_counts(dropna=False).to_dict() if (not summary.empty and "raw_similarity_band" in summary.columns) else {}
     run_summary = {
         "n_candidate_records": int(len(candidates)),
         "n_queries_scored": int(len(summary)),
         "n_top_match_rows_returned": int(len(matches)),
         "candidate_source": str(candidates["_candidate_source"].iloc[0]) if len(candidates) else None,
         "top_k": top_k,
+        "return_match_min_band": str(getattr(config, "RETURN_MATCH_MIN_BAND", "possible_match")),
+        "return_match_threshold": float(get_return_match_threshold(artifacts["thresholds"])),
         "match_band_counts": {str(k): int(v) for k, v in band_counts.items()},
+        "raw_match_band_counts": {str(k): int(v) for k, v in raw_band_counts.items()},
         "strong_or_possible_match_count": int(summary["similarity_band"].isin(["strong_match", "possible_match"]).sum()) if not summary.empty else 0,
-        "weak_or_better_match_count": int(summary["similarity_band"].ne("no_match").sum()) if not summary.empty else 0,
-        "important_note": "No-match queries remain in query_summary. Top-match rows are returned only for weak_match or better.",
+        "returnable_match_count": int(summary["similarity_band"].ne("no_match").sum()) if not summary.empty else 0,
+        "no_match_count": int(summary["similarity_band"].eq("no_match").sum()) if not summary.empty else 0,
+        "important_note": "No-match queries remain in query_summary. Top-match rows are returned only when score >= the configured return_match_threshold. Raw diagnostic bands are preserved in raw_similarity_band.",
     }
     save_json(run_summary, prediction_dir / "prediction_run_summary.json")
     return run_summary

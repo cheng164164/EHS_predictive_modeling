@@ -252,6 +252,175 @@ EARLY_TEXT_FIELDS = [
 ]
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# User-facing match return policy
+# ---------------------------------------------------------------------------
+
+# Minimum score band required before the system treats a query as having a
+# user-facing historical injury match.
+#
+# Why this exists:
+# - The calibrated weak_match threshold is intentionally low. It only means the
+#   score is above ordinary background overlap.
+# - In practice, weak matches can be too noisy for business users and can make
+#   almost every query appear to have a match.
+# - This setting separates diagnostic bands from user-facing output. A record can
+#   have raw_similarity_band = weak_match, but if this parameter is set to
+#   "possible_match", the user-facing similarity_band becomes no_match.
+#
+# Allowed values:
+# - "weak_match": most permissive. Returns weak, possible, and strong matches.
+# - "possible_match": recommended default. Returns only possible and strong
+#   matches; weak evidence is treated as no_match in output files.
+# - "strong_match": most conservative. Returns only strong matches.
+#
+# How to tune:
+# - Use "possible_match" when you want more no_match examples and fewer noisy
+#   low-confidence matches.
+# - Use "strong_match" if stakeholders only want very confident historical
+#   analogs.
+# - Use "weak_match" only for analysis/debugging, not for production displays.
+RETURN_MATCH_MIN_BAND = "possible_match"
+
+# Optional absolute score override for the user-facing return threshold.
+#
+# Default None means: derive the return threshold from RETURN_MATCH_MIN_BAND and
+# the calibrated thresholds.json. For example, if RETURN_MATCH_MIN_BAND is
+# "possible_match", then the return threshold is possible_match_threshold.
+#
+# How to tune:
+# - Keep None for data-driven thresholding.
+# - Set a numeric value such as 0.20 if you want a fixed operational threshold
+#   after reviewing validation/no-match-control results.
+# - If this is set, it overrides RETURN_MATCH_MIN_BAND.
+RETURN_MATCH_MIN_SCORE = None
+
+# Whether to keep the raw diagnostic band in output files.
+#
+# If True, output CSVs include:
+# - raw_similarity_band: calibrated diagnostic band using weak/possible/strong
+# - similarity_band: user-facing band after applying RETURN_MATCH_MIN_BAND
+#
+# This is useful because reviewers can see that a query had weak evidence but was
+# intentionally suppressed as no_match for business use.
+INCLUDE_RAW_SIMILARITY_BAND = True
+
+# ---------------------------------------------------------------------------
+# No-match validation controls
+# ---------------------------------------------------------------------------
+
+# Whether temporal validation should add a small negative-control validation set.
+#
+# Why this exists:
+# - The regular temporal holdout set contains injury records only. Because every
+#   holdout query is itself an injury case, it is expected to resemble at least
+#   some historical injury language, so almost all records may receive weak_match
+#   or better.
+# - This option adds extra validation queries that are expected to have no strong
+#   relationship to historical injury records. These controls demonstrate that
+#   the scoring/threshold logic can produce "no_match" when the input text is not
+#   meaningfully related to the injury reference library.
+#
+# How to tune:
+# - Keep True for validation demos and sanity checks.
+# - Set False if you want validation outputs to contain only real held-out injury
+#   records and no negative controls.
+ENABLE_NO_MATCH_VALIDATION_CONTROLS = True
+
+# Number of real non-injury control rows to add when enough low-similarity
+# non-injury records exist.
+#
+# Important interpretation:
+# - A non-injury record is NOT automatically irrelevant. A near miss or hazard
+#   can be highly relevant if it resembles past injuries. Therefore the code does
+#   not blindly label all non-injury rows as expected no_match.
+# - Instead, it scores non-injury rows against the train/reference injury library
+#   and keeps only the lowest-similarity rows that fall below the weak-match
+#   threshold. These are useful negative controls, not proof that all non-injury
+#   records should be no_match.
+#
+# How to tune:
+# - 10-25: enough examples for validation reports without making files large.
+# - 50+: useful if you want more examples in a dashboard or slide deck.
+# - 0: disable real non-injury controls while keeping synthetic controls.
+NO_MATCH_REAL_CONTROL_SAMPLE_SIZE = 25
+
+# Maximum number of candidate non-injury records to score when looking for real
+# no-match controls.
+#
+# Why this exists:
+# - Scoring every non-injury record can be slow if the dataset is large.
+# - The script samples a reproducible pool, scores that pool, and then keeps the
+#   lowest-similarity records.
+#
+# How to tune:
+# - 500-1,000: faster development runs.
+# - 2,000: balanced default.
+# - 10,000+: more likely to find many real no-match controls, but slower.
+NO_MATCH_REAL_CONTROL_CANDIDATE_POOL_SIZE = 2000
+
+# If True, real non-injury controls are sampled from the holdout/future time
+# period when incident dates are available.
+#
+# Why this exists:
+# - It mirrors the temporal validation setup: older injury history is the
+#   reference library and newer records are treated as future queries.
+#
+# How to tune:
+# - Keep True for the cleanest validation story.
+# - Set False if too few non-injury records exist in the holdout date range.
+NO_MATCH_REAL_CONTROLS_HOLDOUT_PERIOD_ONLY = True
+
+# Synthetic off-domain controls used to prove that clearly irrelevant text can
+# return no_match.
+#
+# Why synthetic controls are included:
+# - Real non-injury EHS records may still be relevant to injuries, so they are
+#   not guaranteed no_match cases.
+# - These synthetic controls are intentionally unrelated administrative or daily
+#   life examples. They should have very low TF-IDF overlap with the injury
+#   reference library and therefore should fall below the weak-match threshold.
+#
+# How to tune:
+# - Keep a small number of clearly irrelevant examples.
+# - Do not make these look like safety incidents; the purpose is to test the
+#   rejection behavior for irrelevant inputs.
+SYNTHETIC_NO_MATCH_CONTROL_RECORDS = [
+    {
+        "incident_id": "synthetic_no_match_001",
+        "incident_category_name": "Negative Control",
+        "title": "Astronomy lecture schedule",
+        "description": "The planetarium agenda includes nebula photography, telescope calibration, and constellation viewing notes.",
+    },
+    {
+        "incident_id": "synthetic_no_match_002",
+        "incident_category_name": "Negative Control",
+        "title": "Sourdough recipe catalog",
+        "description": "The cookbook index lists focaccia, rosemary bread, citrus marmalade, and pastry glazing instructions.",
+    },
+    {
+        "incident_id": "synthetic_no_match_003",
+        "incident_category_name": "Negative Control",
+        "title": "Watercolor gallery exhibit",
+        "description": "The art exhibit features landscape sketches, pigment palettes, canvas framing, and ceramic sculpture labels.",
+    },
+    {
+        "incident_id": "synthetic_no_match_004",
+        "incident_category_name": "Negative Control",
+        "title": "Classical music recital program",
+        "description": "The evening program includes violin sonatas, piano accompaniment, orchestra seating, and composer biographies.",
+    },
+    {
+        "incident_id": "synthetic_no_match_005",
+        "incident_category_name": "Negative Control",
+        "title": "Travel itinerary planning",
+        "description": "The itinerary lists museum reservations, hotel confirmation numbers, passport reminders, and train schedules.",
+    },
+]
+
 # ---------------------------------------------------------------------------
 # Project path helpers
 # ---------------------------------------------------------------------------
