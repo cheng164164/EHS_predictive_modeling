@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python "$SCRIPT_DIR/run_end_to_end.py"
