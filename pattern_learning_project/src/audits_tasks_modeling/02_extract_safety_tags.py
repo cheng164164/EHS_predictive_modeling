@@ -29,6 +29,11 @@ from utils import clean_text_value, ensure_dir, load_table, normalize_embeddings
 # ---------------------------------------------------------------------------
 
 
+def log_progress(message: str) -> None:
+    """Print lightweight phase-level progress updates for long Step 02 runs."""
+    print(f"[Step 02] {message}", flush=True)
+
+
 def normalize_for_rules(value: object) -> str:
     """Normalize text for robust regex matching.
 
@@ -645,22 +650,32 @@ def apply_embedding_fallback(df: pd.DataFrame, tag_df: pd.DataFrame) -> Tuple[pd
     requested = bool(getattr(cfg, "TAG_EMBEDDING_FALLBACK_ENABLED", True))
     summary = {"requested": requested, "available": False, "applied_rows_by_category": {}}
     if not requested:
+        log_progress("Layer 2 embedding fallback is disabled in config.")
         summary["reason"] = "disabled in config"
         return tag_df, summary
 
+    log_progress("Layer 2: loading and aligning Step 01 embeddings for fallback tagging...")
     event_embeddings, emb_info = load_aligned_event_embeddings(df)
     summary["event_embedding_info"] = emb_info
     if event_embeddings is None:
         summary["reason"] = emb_info.get("reason", "event embeddings unavailable")
+        log_progress(f"Layer 2 skipped: {summary['reason']}")
         return tag_df, summary
 
+    log_progress(
+        "Layer 2 embeddings aligned: "
+        f"{emb_info.get('matched_rows', 0):,} matched rows; "
+        f"{emb_info.get('unmatched_rows', 0):,} unmatched rows."
+    )
     embedding_summary = load_embedding_summary()
     provider = str(embedding_summary.get("provider") or cfg.EMBEDDING_PROVIDER)
     model_name = str(embedding_summary.get("model_name") or embedding_summary.get("model") or cfg.EMBEDDING_MODEL_NAME)
     try:
+        log_progress(f"Layer 2: building/loading tag-definition embeddings using provider={provider}, model={model_name}...")
         definition_tables, definition_embeddings = build_definition_tables(provider, model_name)
     except Exception as exc:
         summary["reason"] = f"could not encode tag definitions: {exc}"
+        log_progress(f"Layer 2 skipped: {summary['reason']}")
         return tag_df, summary
 
     tag_definition_library = pd.concat(definition_tables.values(), ignore_index=True)
@@ -671,6 +686,7 @@ def apply_embedding_fallback(df: pd.DataFrame, tag_df: pd.DataFrame) -> Tuple[pd
     fallback_rows_total = 0
 
     valid_embedding_mask = ~np.isnan(event_embeddings).any(axis=1)
+    log_progress("Layer 2: applying embedding fallback by tag category...")
     for category, def_emb in definition_embeddings.items():
         tag_col, method_col, conf_col, sim_col = CATEGORY_TO_OUTPUT[category]
         threshold = get_category_threshold(category)
@@ -720,11 +736,13 @@ def apply_embedding_fallback(df: pd.DataFrame, tag_df: pd.DataFrame) -> Tuple[pd
                 applied += 1
         summary["applied_rows_by_category"][category] = int(applied)
         fallback_rows_total += applied
+        log_progress(f"Layer 2: {category} fallback assigned {applied:,} rows.")
 
     tag_df["risk_theme_candidate"] = [
         choose_theme_candidate(split_pipe(h), split_pipe(c))
         for h, c in zip(tag_df["hazard_tags"], tag_df["control_failure_tags"])
     ]
+    log_progress(f"Layer 2 complete: {fallback_rows_total:,} total fallback assignments.")
     summary.update({
         "available": True,
         "provider": provider,
@@ -898,12 +916,14 @@ def top_terms_from_texts(texts: List[str], n: int = 12) -> str:
 def save_unmatched_discovery(df: pd.DataFrame, output_dir: Path, text_column: str) -> dict:
     enabled = bool(getattr(cfg, "TAG_UNKNOWN_DISCOVERY_ENABLED", True))
     if not enabled:
+        log_progress("Layer 3 unknown-text discovery is disabled in config.")
         return {"enabled": False}
 
     ensure_dir(output_dir)
     sample_size = int(getattr(cfg, "TAG_UNKNOWN_EXPORT_SAMPLE_SIZE", 5000))
     no_label = df["no_label_assigned"].fillna(False).astype(bool)
     unknown_df = df.loc[no_label].copy()
+    log_progress(f"Layer 3: found {len(unknown_df):,} rows with no assigned label.")
     if unknown_df.empty:
         return {"enabled": True, "no_label_rows": 0}
 
@@ -918,6 +938,7 @@ def save_unmatched_discovery(df: pd.DataFrame, output_dir: Path, text_column: st
     sample = unknown_df.sample(n=min(sample_size, len(unknown_df)), random_state=cfg.RANDOM_STATE) if len(unknown_df) > sample_size else unknown_df
     unknown_sample_path = output_dir / "unassigned_any_label_records_sample.csv.gz"
     save_csv(sample[export_cols], unknown_sample_path)
+    log_progress(f"Layer 3: saved no-label sample to {unknown_sample_path}")
 
     category_paths = {}
     for category, (tag_col, _, _, _) in CATEGORY_TO_OUTPUT.items():
@@ -966,6 +987,7 @@ def save_unmatched_discovery(df: pd.DataFrame, output_dir: Path, text_column: st
                     })
                 cluster_path = output_dir / "unassigned_text_discovery_clusters.csv"
                 save_csv(pd.DataFrame(rows), cluster_path)
+                log_progress(f"Layer 3: saved unknown-text discovery clusters to {cluster_path}")
                 cluster_info = {
                     "enabled": True,
                     "cluster_path": str(cluster_path),
@@ -988,6 +1010,7 @@ def save_unmatched_discovery(df: pd.DataFrame, output_dir: Path, text_column: st
 
 
 def main() -> None:
+    log_progress("Starting safety tag extraction.")
     parser = argparse.ArgumentParser(description="Extract safety tags from text using rules, embedding fallback, optional Azure OpenAI, and unknown discovery outputs.")
     parser.add_argument("--input", default=cfg.SAFETY_TEXT_EVENT_PATH)
     parser.add_argument("--output-dir", default=cfg.STEP_02_DIR)
@@ -998,7 +1021,9 @@ def main() -> None:
     args = parser.parse_args()
 
     output_dir = ensure_dir(args.output_dir)
+    log_progress(f"Loading input table from {args.input} ...")
     df = load_table(args.input)
+    log_progress(f"Loaded {len(df):,} rows and {len(df.columns):,} columns.")
     if args.text_column not in df.columns:
         raise ValueError(f"Text column '{args.text_column}' is missing from input file: {args.input}")
 
@@ -1006,14 +1031,18 @@ def main() -> None:
     severe = df.get("severe_actual", pd.Series(False, index=df.index)).fillna(False).astype(bool)
     injury = df.get("any_injury", pd.Series(False, index=df.index)).fillna(False).astype(bool)
 
+    log_progress(f"Layer 1: extracting safety tags with backend={args.backend}...")
     if args.backend == "azure_openai":
         tag_df = llm_extract_rows(df, text, severe, injury, args.model_name, args.sleep_seconds)
     else:
         tag_df = rule_extract(df, args.text_column)
+    log_progress("Layer 1 complete.")
 
     df = df.copy()
     for col in TAG_OUTPUT_COLUMNS + METHOD_COLUMNS:
         df[col] = tag_df[col].values
+
+    log_progress("Copying Layer 1 tag columns back to the event table...")
 
     # Layer 2: semantic fallback to tag definitions, using Step 01 embeddings.
     df_tag_subset = df[TAG_OUTPUT_COLUMNS + METHOD_COLUMNS].copy()
@@ -1021,6 +1050,7 @@ def main() -> None:
     for col in TAG_OUTPUT_COLUMNS + METHOD_COLUMNS:
         df[col] = df_tag_subset[col].values
 
+    log_progress("Computing tag coverage flags...")
     # Booleans should reflect real labels only. Empty means still unassigned.
     df["has_hazard_tag"] = df["hazard_tags"].fillna("").astype(str).ne("")
     df["has_control_failure_tag"] = df["control_failure_tags"].fillna("").astype(str).ne("")
@@ -1039,13 +1069,19 @@ def main() -> None:
     )
 
     output_path = output_dir / "safety_text_event_tagged.csv.gz"
+    log_progress(f"Saving tagged output to {output_path} ...")
     save_csv(df, output_path)
+    log_progress("Tagged output saved.")
 
+    log_progress("Layer 3: creating unmatched-text discovery outputs...")
     unknown_discovery = save_unmatched_discovery(df, output_dir, args.text_column)
     summary = make_coverage_summary(df, args.backend, embedding_fallback_summary)
     summary["output_path"] = str(output_path)
     summary["unmatched_text_discovery"] = unknown_discovery
-    save_json(summary, output_dir / "02_safety_tag_summary.json")
+    summary_path = output_dir / "02_safety_tag_summary.json"
+    log_progress(f"Saving summary JSON to {summary_path} ...")
+    save_json(summary, summary_path)
+    log_progress("Step 02 completed successfully.")
     print(json.dumps(summary, indent=2)[:6000])
 
 
