@@ -3,13 +3,11 @@
 
 Runs without command-line arguments. All settings are in config.py.
 This script does not summarize the dataset. It only checks environment,
-package availability, model loading, and a tiny test summary.
+package availability, model loading, and a tiny manual-generate test.
 """
 from __future__ import annotations
 
-import json
 import traceback
-from pathlib import Path
 
 try:
     from . import config
@@ -28,50 +26,52 @@ def main() -> None:
     print_transformer_diagnostics(report)
 
     try:
-        from transformers import pipeline
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         print(f"Attempting to load model: {config.TRANSFORMER_MODEL_NAME}", flush=True)
-        # Compatibility fix:
-        # Do not pass local_files_only=False through model_kwargs/tokenizer_kwargs.
-        # With some transformers versions this creates a duplicate local_files_only
-        # argument inside AutoConfig.from_pretrained().
-        if bool(getattr(config, "TRANSFORMER_LOCAL_FILES_ONLY", False)):
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        local_only = bool(getattr(config, "TRANSFORMER_LOCAL_FILES_ONLY", False))
+        tokenizer = AutoTokenizer.from_pretrained(config.TRANSFORMER_MODEL_NAME, local_files_only=local_only)
+        model = AutoModelForSeq2SeqLM.from_pretrained(config.TRANSFORMER_MODEL_NAME, local_files_only=local_only)
 
-            print("TRANSFORMER_LOCAL_FILES_ONLY=True; loading from local cache only.", flush=True)
-            tokenizer = AutoTokenizer.from_pretrained(config.TRANSFORMER_MODEL_NAME, local_files_only=True)
-            model = AutoModelForSeq2SeqLM.from_pretrained(config.TRANSFORMER_MODEL_NAME, local_files_only=True)
-            pipe = pipeline(
-                task=config.TRANSFORMER_TASK,
-                model=model,
-                tokenizer=tokenizer,
-                device=config.TRANSFORMER_DEVICE,
-            )
+        requested_device = int(getattr(config, "TRANSFORMER_DEVICE", -1))
+        if requested_device >= 0 and torch.cuda.is_available():
+            device = torch.device(f"cuda:{requested_device}")
         else:
-            pipe = pipeline(
-                task=config.TRANSFORMER_TASK,
-                model=config.TRANSFORMER_MODEL_NAME,
-                tokenizer=config.TRANSFORMER_MODEL_NAME,
-                device=config.TRANSFORMER_DEVICE,
-            )
-        print("Model loaded successfully. Running tiny test summary...", flush=True)
-        result = pipe(
-            "A forklift near miss occurred near a pedestrian walkway. A corrective action was opened to improve traffic separation.",
-            max_length=60,
-            min_length=10,
-            do_sample=False,
-            truncation=True,
+            device = torch.device("cpu")
+        model.to(device)
+        model.eval()
+
+        print(f"Model loaded successfully on device={device}. Running tiny manual-generate test...", flush=True)
+        prompt = (
+            "Write a concise EHS review summary from the evidence only. "
+            "Evidence: 2025-01-05 incident_1 - Forklift near miss occurred near a pedestrian walkway. "
+            "2025-01-06 task_1 - Corrective action opened to improve traffic separation. Summary:"
         )
+        encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        encoded = {k: v.to(device) for k, v in encoded.items()}
+        with torch.no_grad():
+            output_ids = model.generate(
+                **encoded,
+                max_new_tokens=80,
+                min_new_tokens=10,
+                num_beams=4,
+                do_sample=False,
+                early_stopping=True,
+            )
+        summary = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         report["load_test_success"] = True
-        report["test_summary_result"] = result
-        print("Test summary result:", result, flush=True)
+        report["manual_generate_test"] = True
+        report["test_summary_result"] = summary
+        print("Test summary result:", summary, flush=True)
 
     except Exception as exc:
         report["load_test_success"] = False
+        report["manual_generate_test"] = False
         report["error_type"] = type(exc).__name__
         report["error_message"] = str(exc)
         report["traceback"] = traceback.format_exc()
-        print("Model load test failed.", flush=True)
+        print("Model load/generate test failed.", flush=True)
         print(f"Error type: {type(exc).__name__}", flush=True)
         print(f"Error message: {exc}", flush=True)
         print("Traceback:", flush=True)

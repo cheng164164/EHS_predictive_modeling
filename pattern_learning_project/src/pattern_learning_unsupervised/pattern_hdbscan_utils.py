@@ -556,6 +556,272 @@ def compute_clustering_metrics(
     )
 
 
+def _multilingual_stop_words() -> list[str]:
+    """Common English/Spanish process words that dilute phrase labels."""
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+    spanish_stop_words = {
+        "a", "al", "algo", "algunos", "ante", "antes", "como", "con", "contra",
+        "cual", "cuando", "de", "del", "desde", "donde", "durante", "e", "el",
+        "ella", "ellas", "ellos", "en", "entre", "era", "eran", "es", "esa",
+        "esas", "ese", "eso", "esos", "esta", "estaba", "estado", "estan",
+        "estar", "este", "esto", "estos", "fue", "fueron", "ha", "han",
+        "hasta", "hay", "la", "las", "le", "les", "lo", "los", "mas",
+        "me", "mi", "mis", "muy", "no", "nos", "o", "para", "pero", "por",
+        "que", "se", "sin", "sobre", "su", "sus", "tambien", "te", "tiene",
+        "un", "una", "unas", "uno", "unos", "y", "ya", "observa", "observado",
+        "observacion", "detecta", "detectado", "encuentra", "area", "trabajo",
+    }
+    generic_safety_words = {
+        "employee", "employees", "near", "miss", "hazard", "incident", "area",
+        "observed", "identified", "reported", "report", "reports", "record", "records",
+        "work", "working", "worker", "workers", "safe", "safety", "issue", "issues",
+        "condition", "conditions", "found", "noted", "notice", "noticed", "inspection", "inspected", "check",
+        "checked", "need", "needs", "use", "used", "using", "left", "right", "day",
+        "shift", "job", "task", "plant", "site", "department", "location",
+    }
+    return sorted(set(ENGLISH_STOP_WORDS).union(spanish_stop_words).union(generic_safety_words))
+
+
+def _split_csv_terms(value: object) -> list[str]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return []
+    terms = [clean_scalar_text(x) for x in str(value).split(",")]
+    return [x for x in terms if x]
+
+
+def _dedupe_preserve_order(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = clean_scalar_text(value)
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _shorten_text(text: object, max_chars: int = 220) -> str:
+    clean = clean_scalar_text(text)
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def _representative_snippets(part: pd.DataFrame, top_k: int = 5, max_chars: int = 220) -> str:
+    """Return compact examples from high-confidence records for stakeholder review."""
+    if part.empty:
+        return ""
+    sort_col = "membership_strength" if "membership_strength" in part.columns else None
+    if sort_col:
+        sample = part.sort_values(sort_col, ascending=False).head(int(top_k))
+    else:
+        sample = part.head(int(top_k))
+    snippets: list[str] = []
+    for _, row in sample.iterrows():
+        title = clean_scalar_text(row.get("title", ""))
+        desc = clean_scalar_text(row.get("description", ""))
+        model_text = clean_scalar_text(row.get("model_text", ""))
+        raw = title
+        if desc and desc.lower() not in raw.lower():
+            raw = f"{raw} - {desc}" if raw else desc
+        if not raw:
+            raw = model_text
+        if raw:
+            snippets.append(_shorten_text(raw, max_chars=max_chars))
+    return " | ".join(_dedupe_preserve_order(snippets))
+
+
+
+def _normalize_phrase_for_dedup(phrase: object) -> str:
+    """Normalize a phrase for generic de-duplication.
+
+    This is intentionally not domain-specific. It only removes punctuation,
+    repeated whitespace, and casing differences so the labeling layer can avoid
+    repeated/nested phrases such as "buggy whip", "buggy whip light", and
+    "noticed buggy whip".
+    """
+    phrase_text = clean_scalar_text(phrase).lower()
+    phrase_text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fffÁÉÍÓÚÜÑáéíóúüñ]+", " ", phrase_text)
+    phrase_text = re.sub(r"\s+", " ", phrase_text).strip()
+    return phrase_text
+
+
+def _has_repeated_token_pattern(phrase: object) -> bool:
+    """Detect generic repeated phrases like 'light light' or 'abc abc'."""
+    norm = _normalize_phrase_for_dedup(phrase)
+    tokens = norm.split()
+    if len(tokens) < 2:
+        return False
+    if len(tokens) == 2 and tokens[0] == tokens[1]:
+        return True
+    if len(tokens) % 2 == 0:
+        half = len(tokens) // 2
+        if tokens[:half] == tokens[half:]:
+            return True
+    # Also catch adjacent duplicate tokens in longer phrases.
+    return any(tokens[i] == tokens[i - 1] for i in range(1, len(tokens)))
+
+
+
+def _deduplicate_phrases(
+    phrases: Iterable[object],
+    max_phrases: int = 12,
+    containment_threshold: float = 0.80,
+) -> list[str]:
+    """Remove duplicate or nested phrases using only generic text overlap.
+
+    The input order is the model-derived ranking order, usually descending
+    TF-IDF score. When two phrases are near-duplicates, the function keeps the
+    more specific phrase if one phrase contains the other, for example:
+
+        buggy whip + buggy whip light -> buggy whip light
+
+    No safety-domain keyword dictionary or manual hazard taxonomy is used.
+    """
+    selected: list[str] = []
+    selected_norms: list[str] = []
+    seen: set[str] = set()
+
+    for raw in phrases:
+        phrase = clean_scalar_text(raw)
+        norm = _normalize_phrase_for_dedup(phrase)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if _has_repeated_token_pattern(norm):
+            continue
+
+        tokens = set(norm.split())
+        if not tokens:
+            continue
+
+        replace_index: int | None = None
+        is_duplicate = False
+        for idx, selected_norm in enumerate(selected_norms):
+            selected_tokens = set(selected_norm.split())
+            if not selected_tokens:
+                continue
+
+            overlap_candidate = len(tokens & selected_tokens) / max(1, len(tokens))
+            overlap_selected = len(tokens & selected_tokens) / max(1, len(selected_tokens))
+            candidate_contains_selected = selected_norm in norm or selected_tokens.issubset(tokens)
+            selected_contains_candidate = norm in selected_norm or tokens.issubset(selected_tokens)
+
+            if candidate_contains_selected and len(tokens) > len(selected_tokens):
+                # Prefer the more specific nested phrase even if it appears a
+                # little lower in the TF-IDF ranking.
+                replace_index = idx
+                is_duplicate = True
+                break
+
+            if selected_contains_candidate or overlap_candidate >= containment_threshold or overlap_selected >= containment_threshold:
+                is_duplicate = True
+                break
+
+        if replace_index is not None:
+            selected[replace_index] = phrase
+            selected_norms[replace_index] = norm
+            continue
+
+        if is_duplicate:
+            continue
+
+        selected.append(phrase)
+        selected_norms.append(norm)
+        if len(selected) >= int(max_phrases):
+            break
+
+    return selected[: int(max_phrases)]
+
+def _detect_language_note(text_blob: str) -> str:
+    """Generic language/script note for human review.
+
+    This avoids domain-specific keyword logic. It only flags scripts or accented
+    text that may need local-language review.
+    """
+    text_blob = clean_scalar_text(text_blob)
+    notes: list[str] = []
+    if re.search(r"[\u4e00-\u9fff]", text_blob):
+        notes.append("Contains CJK-language text; review the contextual label with local language context.")
+    if re.search(r"[ÁÉÍÓÚÜÑáéíóúüñ]", text_blob):
+        notes.append("Contains accented non-English text; review the contextual label with local language context.")
+    return " ".join(notes)
+
+
+def _make_algorithmic_label(top_phrases: list[str], top_terms: list[str], fallback_label: str) -> str:
+    """Create a short label directly from extracted phrases/terms.
+
+    This is fully data-driven: it uses the highest-ranked cleaned phrases and
+    terms from TF-IDF extraction. No manually curated hazard-family dictionary is
+    used.
+    """
+    phrases = _deduplicate_phrases(top_phrases, max_phrases=4)
+    terms = _deduplicate_phrases(top_terms, max_phrases=4)
+
+    if phrases:
+        # Prefer 1-2 distinctive multi-word phrases; they are usually more
+        # readable than a long list of single words.
+        if len(phrases) == 1:
+            return phrases[0]
+        return " / ".join(phrases[:2])
+    if terms:
+        return " / ".join(terms[:3])
+    return fallback_label
+
+
+def _make_description(
+    entity_type: str,
+    top_phrases: list[str],
+    top_terms: list[str],
+    snippets: str,
+    record_count: int,
+    near_miss_count: int,
+    hazard_identification_count: int,
+) -> str:
+    """Create a short automatic description from phrases and examples only."""
+    phrases = _deduplicate_phrases(top_phrases, max_phrases=8)
+    terms = _deduplicate_phrases(top_terms, max_phrases=8)
+    phrase_text = ", ".join(phrases[:6]) if phrases else ", ".join(terms[:6])
+
+    pieces = [
+        f"This {entity_type} contains {record_count:,} records",
+        f"including {near_miss_count:,} near misses and {hazard_identification_count:,} hazard identifications.",
+    ]
+    if phrase_text:
+        pieces.append(f"The most distinctive automatically extracted phrases/terms are: {phrase_text}.")
+    if snippets:
+        pieces.append(f"Representative examples include: {_shorten_text(snippets, 420)}")
+    pieces.append("Description is generated from cluster text and representative records only; no manual hazard taxonomy is applied.")
+    return " ".join(pieces)
+
+
+def _make_common_scenarios(top_phrases: list[str], top_terms: list[str], snippets: str) -> str:
+    phrases = _deduplicate_phrases(top_phrases, max_phrases=8)
+    if phrases:
+        return "; ".join(phrases[:6])
+    terms = _deduplicate_phrases(top_terms, max_phrases=8)
+    if terms:
+        return "; ".join(terms[:6])
+    if snippets:
+        return _shorten_text(snippets, 300)
+    return "Review representative records for scenario context."
+
+
+def _make_algorithmic_label_basis(top_phrases: list[str], top_terms: list[str]) -> str:
+    phrases = _deduplicate_phrases(top_phrases, max_phrases=5)
+    terms = _deduplicate_phrases(top_terms, max_phrases=5)
+    parts = []
+    if phrases:
+        parts.append("top phrases: " + ", ".join(phrases[:5]))
+    if terms:
+        parts.append("top terms: " + ", ".join(terms[:5]))
+    if not parts:
+        return "Label generated from representative records only."
+    return " | ".join(parts)
+
 def compute_top_terms(
     df: pd.DataFrame,
     labels: Sequence[int],
@@ -564,53 +830,25 @@ def compute_top_terms(
     top_n: int = 10,
     min_df: int = 2,
 ) -> pd.DataFrame:
-    """Extract top TF-IDF terms for each cluster for explainability."""
-    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+    """Extract top TF-IDF keywords/short terms for each cluster or theme."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
 
     labels = np.asarray(labels).astype(int)
     valid_mask = labels != -1
     if valid_mask.sum() == 0:
-        return pd.DataFrame(columns=["cluster_id", "top_terms"])
+        return pd.DataFrame(columns=["cluster_id", "top_terms", "suggested_cluster_label"])
 
-    SPANISH_STOP_WORDS = {
-    "a", "al", "algo", "algunos", "ante", "antes", "como", "con", "contra",
-    "cual", "cuando", "de", "del", "desde", "donde", "durante", "e", "el",
-    "ella", "ellas", "ellos", "en", "entre", "era", "eran", "es", "esa",
-    "esas", "ese", "eso", "esos", "esta", "estaba", "estado", "estan",
-    "estar", "este", "esto", "estos", "fue", "fueron", "ha", "han",
-    "hasta", "hay", "la", "las", "le", "les", "lo", "los", "mas",
-    "me", "mi", "mis", "muy", "no", "nos", "o", "para", "pero", "por",
-    "que", "se", "sin", "sobre", "su", "sus", "tambien", "te", "tiene",
-    "un", "una", "unas", "uno", "unos", "y", "ya"
-    }
-
-    custom_stop = set(ENGLISH_STOP_WORDS).union(SPANISH_STOP_WORDS).union({
-        "employee",
-        "employees",
-        "near",
-        "miss",
-        "hazard",
-        "incident",
-        "area",
-        "observed",
-        "identified",
-        "reported",
-        "work",
-        "working",
-        "safe",
-        "safety",
-    })
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         min_df=min_df,
         ngram_range=(1, 2),
-        stop_words=list(custom_stop),
+        stop_words=_multilingual_stop_words(),
     )
     texts = df[text_col].fillna("").astype(str).tolist()
     try:
         matrix = vectorizer.fit_transform(texts)
     except ValueError:
-        return pd.DataFrame(columns=["cluster_id", "top_terms"])
+        return pd.DataFrame(columns=["cluster_id", "top_terms", "suggested_cluster_label"])
     feature_names = np.asarray(vectorizer.get_feature_names_out())
 
     rows = []
@@ -630,6 +868,114 @@ def compute_top_terms(
         })
     return pd.DataFrame(rows)
 
+
+def compute_top_phrases(
+    df: pd.DataFrame,
+    labels: Sequence[int],
+    text_col: str = "model_text",
+    max_features: int = 30000,
+    top_n: int = 20,
+    min_df: int = 2,
+    ngram_max: int = 4,
+) -> pd.DataFrame:
+    """Extract multi-word TF-IDF phrases for richer cluster/theme descriptions."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    labels = np.asarray(labels).astype(int)
+    if (labels != -1).sum() == 0:
+        return pd.DataFrame(columns=["cluster_id", "top_phrases"])
+
+    texts = df[text_col].fillna("").astype(str).tolist()
+    # Try the configured min_df first, then fall back for small data/small themes.
+    matrix = None
+    feature_names = None
+    for effective_min_df in [max(1, int(min_df)), 1]:
+        try:
+            vectorizer = TfidfVectorizer(
+                max_features=max_features,
+                min_df=effective_min_df,
+                ngram_range=(2, max(2, int(ngram_max))),
+                stop_words=_multilingual_stop_words(),
+            )
+            matrix = vectorizer.fit_transform(texts)
+            feature_names = np.asarray(vectorizer.get_feature_names_out())
+            break
+        except ValueError:
+            matrix = None
+            feature_names = None
+    if matrix is None or feature_names is None:
+        return pd.DataFrame(columns=["cluster_id", "top_phrases"])
+
+    rows = []
+    for cluster_id in sorted(set(labels.tolist())):
+        if cluster_id == -1:
+            continue
+        idx = np.where(labels == cluster_id)[0]
+        if len(idx) == 0:
+            continue
+        mean_scores = np.asarray(matrix[idx].mean(axis=0)).ravel()
+        top_idx = mean_scores.argsort()[::-1]
+        raw_phrases: list[str] = []
+        for i in top_idx:
+            if mean_scores[i] <= 0:
+                break
+            phrase = str(feature_names[i]).strip()
+            # Keep phrase labels compact and avoid very noisy long fragments.
+            if len(phrase) < 4 or len(phrase) > 90:
+                continue
+            raw_phrases.append(phrase)
+            # Pull extra candidates because de-duplication will remove nested phrases.
+            if len(raw_phrases) >= int(top_n) * 5:
+                break
+        phrases = _deduplicate_phrases(raw_phrases, max_phrases=int(top_n))
+        rows.append({"cluster_id": int(cluster_id), "top_phrases": ", ".join(phrases)})
+    return pd.DataFrame(rows)
+
+
+def _contextual_summary_fields(
+    part: pd.DataFrame,
+    entity_type: str,
+    fallback_label: str,
+    top_terms_value: object = "",
+    top_phrases_value: object = "",
+    representative_texts_per_summary: int = 5,
+    summary_max_snippet_chars: int = 220,
+) -> dict:
+    top_terms = _split_csv_terms(top_terms_value)
+    top_phrases = _split_csv_terms(top_phrases_value)
+    top_terms = _deduplicate_phrases(top_terms, max_phrases=10)
+    top_phrases = _deduplicate_phrases(top_phrases, max_phrases=10)
+    snippets = _representative_snippets(
+        part,
+        top_k=representative_texts_per_summary,
+        max_chars=summary_max_snippet_chars,
+    )
+    text_blob = " ".join(top_terms + top_phrases + [snippets])
+    near_miss_count = int(part["incident_category_name"].eq("Near Miss").sum()) if "incident_category_name" in part.columns else 0
+    hazard_count = int(part["incident_category_name"].eq("Hazard Identification").sum()) if "incident_category_name" in part.columns else 0
+    label = _make_algorithmic_label(top_phrases, top_terms, fallback_label)
+    basis = _make_algorithmic_label_basis(top_phrases, top_terms)
+    language_note = _detect_language_note(text_blob)
+    confidence_note = language_note
+    if confidence_note:
+        confidence_note += " "
+    confidence_note += "Label is generated from extracted phrases and representative records only."
+    return {
+        "phrase_based_label": label,
+        "description": _make_description(
+            entity_type=entity_type,
+            top_phrases=top_phrases,
+            top_terms=top_terms,
+            snippets=snippets,
+            record_count=int(len(part)),
+            near_miss_count=near_miss_count,
+            hazard_identification_count=hazard_count,
+        ),
+        "common_scenarios": _make_common_scenarios(top_phrases, top_terms, snippets),
+        "algorithmic_label_basis": basis,
+        "representative_text_snippets": snippets,
+        "context_label_confidence_note": confidence_note,
+    }
 
 def representative_records(
     df: pd.DataFrame,
@@ -673,7 +1019,24 @@ def build_cluster_summary(
     labels: Sequence[int],
     membership_strength: Sequence[float] | None = None,
     top_terms: pd.DataFrame | None = None,
+    contextual_label_config: dict | None = None,
 ) -> pd.DataFrame:
+    """Build one summary row per HDBSCAN cluster.
+
+    In addition to technical TF-IDF keyword labels, this function now adds
+    phrase-based labels and short stakeholder-readable descriptions. The model
+    fitting is unchanged; this only affects reporting and downstream context.
+    """
+    cfg = dict(contextual_label_config or {})
+    enable_contextual = bool(cfg.get("enable_contextual_labels", True))
+    use_contextual_as_primary = bool(cfg.get("use_contextual_label_as_primary", True))
+    phrase_top_n = int(cfg.get("phrase_top_n", 20))
+    phrase_min_df = int(cfg.get("phrase_min_df", 2))
+    phrase_max_features = int(cfg.get("phrase_max_features", 30000))
+    phrase_ngram_max = int(cfg.get("phrase_ngram_max", 4))
+    rep_n = int(cfg.get("representative_texts_per_summary", 5))
+    snippet_chars = int(cfg.get("summary_max_snippet_chars", 220))
+
     labels = np.asarray(labels).astype(int)
     temp = df.copy()
     temp["cluster_id"] = labels
@@ -712,6 +1075,71 @@ def build_cluster_summary(
     else:
         summary["top_terms"] = ""
         summary["suggested_cluster_label"] = summary["cluster_label"]
+
+    summary["keyword_cluster_label"] = summary["cluster_label"]
+
+    if enable_contextual:
+        phrase_df = compute_top_phrases(
+            temp,
+            labels,
+            text_col="model_text",
+            max_features=phrase_max_features,
+            top_n=phrase_top_n,
+            min_df=phrase_min_df,
+            ngram_max=phrase_ngram_max,
+        )
+        if phrase_df.empty:
+            summary["top_phrases"] = ""
+        else:
+            summary = summary.merge(phrase_df, on="cluster_id", how="left")
+            summary["top_phrases"] = summary["top_phrases"].fillna("")
+
+        context_rows = []
+        for _, srow in summary.iterrows():
+            cid = int(srow["cluster_id"])
+            part = temp[temp["cluster_id"].eq(cid)]
+            if cid == -1:
+                fields = {
+                    "phrase_based_cluster_label": "Outlier / unassigned",
+                    "cluster_description": "Records that did not fit a dense recurring pattern. Review these as potential emerging, rare, or poorly described scenarios.",
+                    "cluster_common_scenarios": "Review individual outlier records for context.",
+                    "cluster_algorithmic_label_basis": "Outlier records are not summarized with a stable phrase basis.",
+                    "cluster_representative_text_snippets": _representative_snippets(part, rep_n, snippet_chars),
+                    "cluster_context_label_confidence_note": "Outlier group is not a coherent HDBSCAN cluster.",
+                }
+            else:
+                base_label = str(srow.get("cluster_label", f"Cluster {cid}"))
+                ctx = _contextual_summary_fields(
+                    part=part,
+                    entity_type="cluster",
+                    fallback_label=base_label,
+                    top_terms_value=srow.get("top_terms", ""),
+                    top_phrases_value=srow.get("top_phrases", ""),
+                    representative_texts_per_summary=rep_n,
+                    summary_max_snippet_chars=snippet_chars,
+                )
+                fields = {
+                    "phrase_based_cluster_label": ctx["phrase_based_label"],
+                    "cluster_description": ctx["description"],
+                    "cluster_common_scenarios": ctx["common_scenarios"],
+                    "cluster_algorithmic_label_basis": ctx["algorithmic_label_basis"],
+                    "cluster_representative_text_snippets": ctx["representative_text_snippets"],
+                    "cluster_context_label_confidence_note": ctx["context_label_confidence_note"],
+                }
+            context_rows.append({"cluster_id": cid, **fields})
+        context_df = pd.DataFrame(context_rows)
+        summary = summary.merge(context_df, on="cluster_id", how="left")
+        if use_contextual_as_primary:
+            mask = summary["cluster_id"].ne(-1) & summary["phrase_based_cluster_label"].fillna("").ne("")
+            summary.loc[mask, "cluster_label"] = summary.loc[mask, "phrase_based_cluster_label"]
+    else:
+        for col in [
+            "top_phrases", "phrase_based_cluster_label", "cluster_description",
+            "cluster_common_scenarios", "cluster_algorithmic_label_basis",
+            "cluster_representative_text_snippets",
+            "cluster_context_label_confidence_note",
+        ]:
+            summary[col] = ""
 
     return summary
 
@@ -993,10 +1421,26 @@ def build_theme_summary(
     scored_df: pd.DataFrame,
     theme_top_terms: pd.DataFrame | None = None,
     top_clusters_n: int = 8,
+    contextual_label_config: dict | None = None,
 ) -> pd.DataFrame:
-    """Build one summary row per theme."""
+    """Build one summary row per second-level theme.
+
+    Themes are broader groups above HDBSCAN clusters. This function keeps the
+    technical keyword labels and adds richer phrase-based descriptions for
+    stakeholder use.
+    """
     if "theme_id" not in scored_df.columns:
         return pd.DataFrame()
+
+    cfg = dict(contextual_label_config or {})
+    enable_contextual = bool(cfg.get("enable_contextual_labels", True))
+    use_contextual_as_primary = bool(cfg.get("use_contextual_label_as_primary", True))
+    phrase_top_n = int(cfg.get("phrase_top_n", 20))
+    phrase_min_df = int(cfg.get("phrase_min_df", 2))
+    phrase_max_features = int(cfg.get("phrase_max_features", 30000))
+    phrase_ngram_max = int(cfg.get("phrase_ngram_max", 4))
+    rep_n = int(cfg.get("representative_texts_per_summary", 5))
+    snippet_chars = int(cfg.get("summary_max_snippet_chars", 220))
 
     temp = scored_df.copy()
     temp["theme_id"] = temp["theme_id"].fillna(-1).astype(int)
@@ -1050,7 +1494,74 @@ def build_theme_summary(
     else:
         summary["theme_top_terms"] = ""
         summary["suggested_theme_label"] = summary["theme_label"]
+
+    summary["keyword_theme_label"] = summary["theme_label"]
+
+    if enable_contextual:
+        phrase_df = compute_top_phrases(
+            temp,
+            temp["theme_id"].to_numpy(dtype=int),
+            text_col="model_text",
+            max_features=phrase_max_features,
+            top_n=phrase_top_n,
+            min_df=phrase_min_df,
+            ngram_max=phrase_ngram_max,
+        )
+        if phrase_df.empty:
+            summary["theme_top_phrases"] = ""
+        else:
+            phrase_df = phrase_df.rename(columns={"cluster_id": "theme_id", "top_phrases": "theme_top_phrases"})
+            summary = summary.merge(phrase_df, on="theme_id", how="left")
+            summary["theme_top_phrases"] = summary["theme_top_phrases"].fillna("")
+
+        context_rows = []
+        for _, srow in summary.iterrows():
+            tid = int(srow["theme_id"])
+            part = temp[temp["theme_id"].eq(tid)]
+            if tid == -1:
+                fields = {
+                    "phrase_based_theme_label": "Outlier / unassigned theme",
+                    "theme_description": "Records that did not belong to an assigned theme. Review these as possible emerging, rare, or poorly described scenarios.",
+                    "theme_common_scenarios": "Review individual outlier records for context.",
+                    "theme_algorithmic_label_basis": "Outlier records are not summarized with a stable phrase basis.",
+                    "theme_representative_text_snippets": _representative_snippets(part, rep_n, snippet_chars),
+                    "theme_context_label_confidence_note": "Outlier group is not a coherent learned theme.",
+                }
+            else:
+                base_label = str(srow.get("theme_label", f"Theme {tid}"))
+                ctx = _contextual_summary_fields(
+                    part=part,
+                    entity_type="theme",
+                    fallback_label=base_label,
+                    top_terms_value=srow.get("theme_top_terms", ""),
+                    top_phrases_value=srow.get("theme_top_phrases", ""),
+                    representative_texts_per_summary=rep_n,
+                    summary_max_snippet_chars=snippet_chars,
+                )
+                fields = {
+                    "phrase_based_theme_label": ctx["phrase_based_label"],
+                    "theme_description": ctx["description"],
+                    "theme_common_scenarios": ctx["common_scenarios"],
+                    "theme_algorithmic_label_basis": ctx["algorithmic_label_basis"],
+                    "theme_representative_text_snippets": ctx["representative_text_snippets"],
+                    "theme_context_label_confidence_note": ctx["context_label_confidence_note"],
+                }
+            context_rows.append({"theme_id": tid, **fields})
+        summary = summary.merge(pd.DataFrame(context_rows), on="theme_id", how="left")
+        if use_contextual_as_primary:
+            mask = summary["theme_id"].ne(-1) & summary["phrase_based_theme_label"].fillna("").ne("")
+            summary.loc[mask, "theme_label"] = summary.loc[mask, "phrase_based_theme_label"]
+    else:
+        for col in [
+            "theme_top_phrases", "phrase_based_theme_label", "theme_description",
+            "theme_common_scenarios", "theme_algorithmic_label_basis",
+            "theme_representative_text_snippets",
+            "theme_context_label_confidence_note",
+        ]:
+            summary[col] = ""
+
     return summary
+
 
 
 def attach_themes_to_cluster_summary(
@@ -1067,12 +1578,26 @@ def attach_themes_to_cluster_summary(
     out["theme_id"] = out["theme_id"].fillna(-1).astype(int)
 
     if theme_summary is not None and not theme_summary.empty:
-        theme_cols = [c for c in ["theme_id", "theme_label", "theme_top_terms"] if c in theme_summary.columns]
+        theme_cols = [c for c in [
+            "theme_id",
+            "theme_label",
+            "keyword_theme_label",
+            "theme_top_terms",
+            "theme_top_phrases",
+            "phrase_based_theme_label",
+            "theme_description",
+            "theme_common_scenarios",
+            "theme_algorithmic_label_basis",
+            "theme_representative_text_snippets",
+            "theme_context_label_confidence_note",
+        ] if c in theme_summary.columns]
         out = out.merge(theme_summary[theme_cols].drop_duplicates("theme_id"), on="theme_id", how="left")
     else:
         out["theme_label"] = np.where(out["theme_id"].eq(-1), "Outlier / unassigned theme", out["theme_id"].map(lambda x: f"Theme {x}"))
         out["theme_top_terms"] = ""
+        out["theme_top_phrases"] = ""
     return out
+
 
 
 def build_theme_site_summary(scored_df: pd.DataFrame) -> pd.DataFrame:
@@ -1128,22 +1653,37 @@ def build_theme_monthly_trend(scored_df: pd.DataFrame) -> pd.DataFrame:
     return trend.groupby("theme_id", group_keys=False).apply(flag).reset_index(drop=True)
 
 def attach_cluster_labels(scored_df: pd.DataFrame, cluster_summary: pd.DataFrame) -> pd.DataFrame:
-    """Attach cluster and optional theme labels to scored records.
+    """Attach cluster and optional theme labels/descriptions to scored records.
 
-    Older model artifacts only contain cluster columns. Newer artifacts may also
-    contain theme columns. This function handles both cases so the scoring script
-    remains backward compatible.
+    Older model artifacts only contain cluster columns. Newer artifacts also
+    contain phrase-based labels and descriptions. This function handles both so
+    the scoring script remains backward compatible.
     """
     cols = [
         "cluster_id",
         "cluster_label",
+        "keyword_cluster_label",
         "top_terms",
+        "top_phrases",
+        "phrase_based_cluster_label",
+        "cluster_description",
+        "cluster_common_scenarios",
+        "cluster_algorithmic_label_basis",
+        "cluster_context_label_confidence_note",
         "theme_id",
         "theme_label",
+        "keyword_theme_label",
         "theme_top_terms",
+        "theme_top_phrases",
+        "phrase_based_theme_label",
+        "theme_description",
+        "theme_common_scenarios",
+        "theme_algorithmic_label_basis",
+        "theme_context_label_confidence_note",
     ]
     available = [c for c in cols if c in cluster_summary.columns]
     return scored_df.merge(cluster_summary[available], on="cluster_id", how="left")
+
 
 
 def build_cluster_site_summary(scored_df: pd.DataFrame) -> pd.DataFrame:
@@ -1284,10 +1824,24 @@ def compact_business_columns(df: pd.DataFrame) -> pd.DataFrame:
         "model_text_char_count",
         "cluster_id",
         "cluster_label",
+        "keyword_cluster_label",
         "top_terms",
+        "top_phrases",
+        "phrase_based_cluster_label",
+        "cluster_description",
+        "cluster_common_scenarios",
+        "cluster_algorithmic_label_basis",
+        "cluster_context_label_confidence_note",
         "theme_id",
         "theme_label",
+        "keyword_theme_label",
         "theme_top_terms",
+        "theme_top_phrases",
+        "phrase_based_theme_label",
+        "theme_description",
+        "theme_common_scenarios",
+        "theme_algorithmic_label_basis",
+        "theme_context_label_confidence_note",
         "membership_strength",
         "is_outlier",
         "split",
@@ -1297,6 +1851,7 @@ def compact_business_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns and col not in cols:
             cols.append(col)
     return df[cols].copy()
+
 
 
 def save_model_artifacts(

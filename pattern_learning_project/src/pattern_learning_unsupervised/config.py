@@ -196,6 +196,32 @@ THEME_MIN_RECORDS_PER_CLUSTER = 1
 THEME_TOP_TERMS_N = 12
 THEME_TOP_CLUSTERS_N = 8
 
+# ------------------------------------------------------------------
+# Contextual cluster/theme descriptions
+# ------------------------------------------------------------------
+# These settings only affect the reporting layer. They do not change embeddings,
+# UMAP, HDBSCAN, or theme grouping. The training script will still output the
+# original keyword labels, but it will also add phrase-based labels and
+# short stakeholder-readable descriptions.
+ENABLE_CONTEXTUAL_LABELS = True
+
+# If True, cluster_label/theme_label use the richer phrase-based label. The old
+# keyword-only labels are preserved in keyword_cluster_label and
+# keyword_theme_label.
+USE_CONTEXTUAL_LABEL_AS_PRIMARY = True
+
+# Multi-word phrase extraction settings. These phrases are used to generate
+# richer labels/descriptions from the cluster text itself, without applying
+# any manually curated hazard taxonomy.
+PHRASE_TOP_N = 20
+PHRASE_MIN_DF = 2
+PHRASE_MAX_FEATURES = 30000
+PHRASE_NGRAM_MAX = 4
+
+# Representative records included in cluster/theme descriptions.
+REPRESENTATIVE_TEXTS_PER_SUMMARY = 5
+SUMMARY_MAX_SNIPPET_CHARS = 220
+
 # Metrics and output behavior.
 METRIC_SAMPLE_SIZE = 10000
 FIT_FINAL = True

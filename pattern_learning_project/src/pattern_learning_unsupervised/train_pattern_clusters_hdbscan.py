@@ -110,6 +110,16 @@ def build_run_config() -> dict:
             "top_terms_n": int(getattr(config, "THEME_TOP_TERMS_N", 12)),
             "top_clusters_n": int(getattr(config, "THEME_TOP_CLUSTERS_N", 8)),
         },
+        "contextual_labeling": {
+            "enable_contextual_labels": bool(getattr(config, "ENABLE_CONTEXTUAL_LABELS", True)),
+            "use_contextual_label_as_primary": bool(getattr(config, "USE_CONTEXTUAL_LABEL_AS_PRIMARY", True)),
+            "phrase_top_n": int(getattr(config, "PHRASE_TOP_N", 20)),
+            "phrase_min_df": int(getattr(config, "PHRASE_MIN_DF", 2)),
+            "phrase_max_features": int(getattr(config, "PHRASE_MAX_FEATURES", 30000)),
+            "phrase_ngram_max": int(getattr(config, "PHRASE_NGRAM_MAX", 4)),
+            "representative_texts_per_summary": int(getattr(config, "REPRESENTATIVE_TEXTS_PER_SUMMARY", 5)),
+            "summary_max_snippet_chars": int(getattr(config, "SUMMARY_MAX_SNIPPET_CHARS", 220)),
+        },
         "metric_sample_size": int(config.METRIC_SAMPLE_SIZE),
         "fit_final": bool(config.FIT_FINAL),
     }
@@ -257,6 +267,7 @@ def add_theme_layer(
         temp_scored,
         theme_top_terms=theme_top_terms,
         top_clusters_n=int(theme_config.get("top_clusters_n", 8)),
+        contextual_label_config=run_config.get("contextual_labeling", {}),
     )
     cluster_summary = attach_themes_to_cluster_summary(
         cluster_summary,
@@ -392,6 +403,7 @@ def main() -> None:
         dev["train_labels"],
         dev["train_strengths"],
         validation_top_terms,
+        contextual_label_config=run_config.get("contextual_labeling", {}),
     )
 
     print("Building validation theme layer", flush=True)
@@ -467,7 +479,13 @@ def main() -> None:
     final_metrics_df.to_csv(final_dir / "final_model_metrics.csv", index=False)
 
     final_top_terms = compute_top_terms(final_df, final_labels, text_col="model_text")
-    cluster_summary = build_cluster_summary(final_df, final_labels, final_strengths, final_top_terms)
+    cluster_summary = build_cluster_summary(
+        final_df,
+        final_labels,
+        final_strengths,
+        final_top_terms,
+        contextual_label_config=run_config.get("contextual_labeling", {}),
+    )
 
     print("Building final theme layer", flush=True)
     final_theme_source_vectors = choose_theme_source_vectors(

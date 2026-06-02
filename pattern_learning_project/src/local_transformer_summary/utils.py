@@ -302,11 +302,13 @@ def facts_to_frame(facts: Dict[Tuple[str, str, str, str, str, str], dict]) -> pd
 def keyword_themes(text: str, max_terms: int = 12) -> str:
     words = re.findall(r"[A-Za-z][A-Za-z\-]{3,}", text.lower())
     stop = set(
-        "title description status source event date with from that this were have been into during "
-        "employee employees record records location task audit incident near miss closed open pending injury "
-        "safety action actions hazard hazards observation observations identified identification summary".split()
+        "title description status source event date dates with from that this were have been into during "
+        "employee employees record records location task tasks audit audits incident incidents near miss closed open pending "
+        "injury injuries safety action actions corrective hazard hazards observation observations observed identified identification "
+        "summary summarize period immediateaction immediate offpremiseslocation premiseslocation first second third shift area "
+        "department plant site review completed complete normal serious condition unsafe safe act ehs".split()
     )
-    counts = Counter(w for w in words if w not in stop)
+    counts = Counter(w for w in words if w not in stop and not w.isdigit())
     return ", ".join([w for w, _ in counts.most_common(max_terms)])
 
 

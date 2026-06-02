@@ -1,244 +1,494 @@
-"""Central configuration for the audits/tasks text-first risk modeling pipeline.
+"""Configuration for audits_tasks_modeling theme-mining pipeline.
 
-Edit this file once, then run any step directly, for example:
+This file keeps the existing Step 00 unified-event settings and adds a
+source-aware clustering pipeline for:
+  1) incident/hazard/near-miss/injury records
+  2) audit/observation records
+  3) task/action records
 
-    python 00_build_unified_text_events.py
-    python 01_generate_embeddings.py
-    python run_end_to_end.py
+All scripts can be run without command-line arguments. Change settings here.
 
-The defaults assume the CSV exports are stored in the project root. In the
-ChatGPT sandbox that project root is /mnt/data. In your repo it is the folder
-that contains src/ and outputs/.
+Quick POC mode is enabled by default to avoid embedding every record. It first
+chooses major case-heavy locations, then draws a capped stratified sample from
+those locations. Increase/decrease the caps below for faster or broader tests.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Optional
-
-
-def _optional_int(value: str | None) -> Optional[int]:
-    if value is None or str(value).strip() == "":
-        return None
-    return int(value)
-
 
 # ---------------------------------------------------------------------------
-# Base folders
+# Project paths
 # ---------------------------------------------------------------------------
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(os.environ.get("SAFETY_PROJECT_ROOT", SRC_DIR.parents[1])).resolve()
+THIS_FILE = Path(__file__).resolve()
+# config.py path: pattern_learning_project/src/audits_tasks_modeling/config.py
+PROJECT_ROOT = THIS_FILE.parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "audits_tasks_modeling"
 
-
-def _detect_data_dir(project_root: Path) -> Path:
-    """Return the folder that contains the required raw CSV exports.
-
-    Priority:
-      1. SAFETY_DATA_DIR environment variable, if set
-      2. <project_root>/data/raw
-      3. <project_root>/data
-      4. <project_root>
-    """
-    env_value = os.environ.get("SAFETY_DATA_DIR")
-    if env_value:
-        return Path(env_value).expanduser().resolve()
-
-    candidates = [
-        project_root / "data" / "raw",
-        project_root / "data",
-        project_root,
-    ]
-
-    required_names = {
-        "AUDIT_VIEW.csv",
-        "INCIDENT_VIEW.csv",
-        "INCIDENTINJURY_VIEW.csv",
-        "LISTITEM_VIEW.csv",
-        "LOCATION_VIEW.csv",
-        "TASK_VIEW.csv",
-    }
-
-    for candidate in candidates:
-        if candidate.exists():
-            existing_names = {p.name for p in candidate.glob("*.csv")}
-            if required_names.issubset(existing_names):
-                return candidate.resolve()
-
-    return (project_root / "data" / "raw").resolve()
-
-
-DATA_DIR = _detect_data_dir(PROJECT_ROOT)
-OUTPUT_ROOT = Path(
-    os.environ.get("SAFETY_OUTPUT_ROOT", PROJECT_ROOT / "outputs" / "audits_tasks_modeling")
-).resolve()
-
-# Raw input files. Change DATA_DIR above if these CSVs live elsewhere.
-AUDIT_VIEW_PATH = DATA_DIR / "AUDIT_VIEW.csv"
-INCIDENT_VIEW_PATH = DATA_DIR / "INCIDENT_VIEW.csv"
-INCIDENTINJURY_VIEW_PATH = DATA_DIR / "INCIDENTINJURY_VIEW.csv"
-LISTITEM_VIEW_PATH = DATA_DIR / "LISTITEM_VIEW.csv"
-LOCATION_VIEW_PATH = DATA_DIR / "LOCATION_VIEW.csv"
-TASK_VIEW_PATH = DATA_DIR / "TASK_VIEW.csv"
-
-# Clear step output structure under OUTPUT_ROOT.
+# Existing Step 00 unified table output folder.
 STEP_00_DIR = OUTPUT_ROOT / "00_unified_text_events"
-STEP_01_DIR = OUTPUT_ROOT / "01_embeddings"
-STEP_02_DIR = OUTPUT_ROOT / "02_safety_tags"
-STEP_03_DIR = OUTPUT_ROOT / "03_risk_theme_discovery"
-STEP_04_DIR = OUTPUT_ROOT / "04_theme_assignment"
-STEP_05_DIR = OUTPUT_ROOT / "05_risk_state_dataset"
-STEP_06_DIR = OUTPUT_ROOT / "06_risk_burden_model"
-STEP_07_DIR = OUTPUT_ROOT / "07_elevated_risk_classifier"
-STEP_08_DIR = OUTPUT_ROOT / "08_risk_driver_explanations"
+UNIFIED_EVENTS_FILE = STEP_00_DIR / "safety_text_event.csv.gz"
 
-# Main intermediate files.
-LOCATION_HIERARCHY_PATH = STEP_00_DIR / "location_hierarchy.csv"
-SAFETY_TEXT_EVENT_PATH = STEP_00_DIR / "safety_text_event.csv.gz"
-TEXT_EMBEDDINGS_PATH = STEP_01_DIR / "text_embeddings.npy"
-TEXT_EMBEDDING_EVENT_IDS_PATH = STEP_01_DIR / "text_embedding_event_ids.csv.gz"
-TAGGED_EVENTS_PATH = STEP_02_DIR / "safety_text_event_tagged.csv.gz"
-THEME_MEMBERSHIPS_PATH = STEP_03_DIR / "discovered_theme_memberships.csv.gz"
-THEME_LIBRARY_PATH = STEP_03_DIR / "risk_theme_library.csv"
-THEME_CENTROIDS_PATH = STEP_03_DIR / "risk_theme_centroids.npy"
-THEMED_EVENTS_PATH = STEP_04_DIR / "safety_text_event_themed.csv.gz"
-THEME_ASSIGNMENTS_PATH = STEP_04_DIR / "risk_theme_assignments.csv.gz"
-RISK_STATE_DATA_PATH = STEP_05_DIR / "risk_state_training_data.csv.gz"
+# New theme-mining output folders.
+THEME_INPUT_DIR = OUTPUT_ROOT / "01_theme_input"
+THEME_EMBEDDING_DIR = OUTPUT_ROOT / "02_theme_embeddings"
+THEME_CLUSTER_DIR = OUTPUT_ROOT / "03_theme_clusters"
+THEME_CATALOG_DIR = OUTPUT_ROOT / "04_theme_catalog"
+THEME_PROFILE_DIR = OUTPUT_ROOT / "05_location_theme_profiles"
+THEME_LINK_DIR = OUTPUT_ROOT / "06_theme_links"
+THEME_LOG_DIR = OUTPUT_ROOT / "logs"
 
 # ---------------------------------------------------------------------------
-# Step 0: unified event table
+# Existing Step 00 settings. These are used by 00_build_unified_text_events.py.
 # ---------------------------------------------------------------------------
-SAMPLE_SIZE = _optional_int(os.environ.get("SAFETY_SAMPLE_SIZE"))
-DROP_EMPTY_TEXT = os.environ.get("DROP_EMPTY_TEXT", "false").lower() in {"1", "true", "yes", "y"}
-ENGLISH_ONLY_TEXT_FILTER=False
-# ---------------------------------------------------------------------------
-# Step 1: embeddings
-# ---------------------------------------------------------------------------
-TEXT_COLUMN = os.environ.get("TEXT_COLUMN", "clean_text")
-# Default changed to sentence_transformer as requested.
-EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "tfidf_svd")
-SENTENCE_TRANSFORMER_MODEL = os.environ.get(
-    "SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get(
-    "AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large"
-)
-# Used by the CLI default. Change this if you switch EMBEDDING_PROVIDER.
-EMBEDDING_MODEL_NAME = os.environ.get(
-    "EMBEDDING_MODEL_NAME",
-    AZURE_OPENAI_EMBEDDING_DEPLOYMENT if EMBEDDING_PROVIDER == "azure_openai" else SENTENCE_TRANSFORMER_MODEL,
-)
-EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "256"))
-TFIDF_SVD_COMPONENTS = int(os.environ.get("TFIDF_SVD_COMPONENTS", "128"))
-TFIDF_MAX_FEATURES = int(os.environ.get("TFIDF_MAX_FEATURES", "50000"))
-TFIDF_MIN_DF = int(os.environ.get("TFIDF_MIN_DF", "3"))
-TFIDF_NGRAM_MAX = int(os.environ.get("TFIDF_NGRAM_MAX", "2"))
+SAMPLE_SIZE = None
+DROP_EMPTY_TEXT = True
+ENGLISH_ONLY_TEXT_FILTER = False
+LANGUAGE_DETECTION_LIBRARY = "langdetect"
+LANGUAGE_DETECTION_RANDOM_STATE = 42
+LANGUAGE_DETECTION_MIN_PROB = 0.80
+LANGUAGE_DETECTION_MIN_TEXT_CHARS = 20
+LANGUAGE_DETECTION_MAX_TEXT_CHARS = 1000
+ENGLISH_ONLY_KEEP_SHORT_TEXT = True
+ENGLISH_ONLY_KEEP_UNKNOWN_LANGUAGE = False
+LANGUAGE_DETECTION_PROGRESS_EVERY = 50000
+
+# Set True in run_theme_mining_end_to_end.py if you want to rebuild unified data
+# from raw data. If False, the pipeline uses UNIFIED_EVENTS_FILE if it exists.
+RUN_STEP_00_IN_END_TO_END = False
 
 # ---------------------------------------------------------------------------
-# Step 2: safety tag extraction
+# Source family names used throughout the project.
 # ---------------------------------------------------------------------------
-# Default is local-only: regex rules + optional embedding fallback. LLM extraction
-# remains available through TAG_BACKEND=azure_openai, but is intentionally not
-# the default for simplicity, cost control, and repeatability.
-TAG_BACKEND = os.environ.get("TAG_BACKEND", "rules")  # rules or azure_openai
-AZURE_OPENAI_CHAT_DEPLOYMENT = os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o")
-TAG_LLM_SLEEP_SECONDS = float(os.environ.get("TAG_LLM_SLEEP_SECONDS", "0"))
+FAMILY_INCIDENT_HAZARD = "incident_hazard"
 
-# Layer 2: use Step 01 text embeddings to assign a fallback tag when regex rules
-# do not match a category. This reduces unassigned rows without relying on an LLM.
-TAG_EMBEDDING_FALLBACK_ENABLED = os.environ.get("TAG_EMBEDDING_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes", "y"}
-TAG_EMBEDDING_FALLBACK_FILL_ONLY_EMPTY = os.environ.get("TAG_EMBEDDING_FALLBACK_FILL_ONLY_EMPTY", "true").lower() in {"1", "true", "yes", "y"}
-TAG_EMBEDDING_FALLBACK_TOP_K = int(os.environ.get("TAG_EMBEDDING_FALLBACK_TOP_K", "1"))
-TAG_EMBEDDING_FALLBACK_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_THRESHOLD", "0.30"))
-TAG_EMBEDDING_FALLBACK_HAZARD_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_HAZARD_THRESHOLD", "0.30"))
-TAG_EMBEDDING_FALLBACK_CONTROL_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_CONTROL_THRESHOLD", "0.30"))
-TAG_EMBEDDING_FALLBACK_ENERGY_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_ENERGY_THRESHOLD", "0.30"))
-TAG_EMBEDDING_FALLBACK_ACTION_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_ACTION_THRESHOLD", "0.30"))
-TAG_EMBEDDING_FALLBACK_HIGH_CONFIDENCE_THRESHOLD = float(os.environ.get("TAG_EMBEDDING_FALLBACK_HIGH_CONFIDENCE_THRESHOLD", "0.46"))
+# Raw audit rows are first detected as FAMILY_AUDIT_OBSERVATION, then split
+# into separate clustering families. Do not cluster the raw family directly.
+FAMILY_AUDIT_OBSERVATION = "audit_observation"  # raw/legacy audit family
+FAMILY_AUDIT_RISK = "audit_risk"                # unsafe acts/conditions + risk observations
+FAMILY_AUDIT_POSITIVE = "audit_positive"        # safe acts/conditions + positive controls
+FAMILY_AUDIT_ACTIVITY = "audit_activity"        # routine/admin/accounting only, not clustered
 
-# Layer 3: save unmatched records and cluster a sample of still-unassigned text so
-# you can discover missing dictionary terms/patterns.
-TAG_UNKNOWN_DISCOVERY_ENABLED = os.environ.get("TAG_UNKNOWN_DISCOVERY_ENABLED", "true").lower() in {"1", "true", "yes", "y"}
-TAG_UNKNOWN_EXPORT_SAMPLE_SIZE = int(os.environ.get("TAG_UNKNOWN_EXPORT_SAMPLE_SIZE", "5000"))
-TAG_UNKNOWN_DISCOVERY_SAMPLE_SIZE = int(os.environ.get("TAG_UNKNOWN_DISCOVERY_SAMPLE_SIZE", "50000"))
-TAG_UNKNOWN_CLUSTER_COUNT = int(os.environ.get("TAG_UNKNOWN_CLUSTER_COUNT", "25"))
+FAMILY_TASK_ACTION = "task_action"
+
+# Families in SOURCE_FAMILIES are embedded and clustered. Audit activity is
+# kept in accounting files but intentionally excluded from clustering.
+SOURCE_FAMILIES = [
+    FAMILY_INCIDENT_HAZARD,
+    FAMILY_AUDIT_RISK,
+    FAMILY_AUDIT_POSITIVE,
+    FAMILY_TASK_ACTION,
+]
+AUDIT_CLUSTER_FAMILIES = [FAMILY_AUDIT_RISK, FAMILY_AUDIT_POSITIVE]
 
 # ---------------------------------------------------------------------------
-# Step 3: risk theme discovery
+# Theme input preparation
 # ---------------------------------------------------------------------------
-EXCLUDE_TASKS_FROM_THEME_DISCOVERY = os.environ.get("EXCLUDE_TASKS_FROM_THEME_DISCOVERY", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
+MIN_TEXT_LENGTH = 20
+MAX_TEXT_CHARS_FOR_MODEL = 600
+DROP_DUPLICATE_THEME_TEXT_WITHIN_FAMILY = False
+
+# Optional date limits. Use None to include all dates.
+MIN_EVENT_DATE = None  # Example: "2015-01-01"
+MAX_EVENT_DATE = None  # Example: "2026-12-31"
+
+RANDOM_STATE = 42
+
+# ---------------------------------------------------------------------------
+# Quick POC sampling by major case-heavy locations
+# ---------------------------------------------------------------------------
+# This is the recommended setting for a fast concept proof. Step 01 still reads
+# the full unified file to identify the largest/most relevant locations, but it
+# only passes the selected sample into the embedding/clustering steps.
+ENABLE_POC_MAJOR_LOCATION_SAMPLE = True
+
+# Select locations with large amounts of hazards, near misses, injuries,
+# audits/observations, and tasks/actions. Use 10-15 for a quick POC.
+POC_TOP_LOCATIONS = 12
+POC_MIN_LOCATION_RECORDS = 100
+POC_MIN_FAMILIES_PRESENT = 2
+
+# Optional manual override. If non-empty, these location_id values are used in
+# addition to the score-selected locations.
+POC_INCLUDE_LOCATION_IDS: list[str] = []
+POC_EXCLUDE_LOCATION_IDS: list[str] = []
+
+# Maximum total records passed to embedding/clustering. Set to 100000 for a
+# broader POC; keep 30000-60000 for quick iteration on CPU.
+POC_MAX_TOTAL_RECORDS = 20000
+
+# Family quotas should sum to POC_MAX_TOTAL_RECORDS. If they do not, the code
+# scales them automatically. Equal-ish quotas prevent audits/tasks from drowning
+# out incident/hazard records.
+POC_FAMILY_QUOTAS = {
+    FAMILY_INCIDENT_HAZARD: 8000,
+    FAMILY_AUDIT_RISK: 3500,
+    FAMILY_AUDIT_POSITIVE: 3500,
+    FAMILY_TASK_ACTION: 5000,
 }
-# Discover risk themes on a representative sample, then Step 4 assigns all records
-# to the discovered theme centroids by cosine similarity. This keeps UMAP/HDBSCAN fast.
-THEME_DISCOVERY_SAMPLE_SIZE = _optional_int(os.environ.get("THEME_DISCOVERY_SAMPLE_SIZE", "100000"))
-THEME_DISCOVERY_SAMPLE_STRATEGY = os.environ.get("THEME_DISCOVERY_SAMPLE_STRATEGY", "stratified")
-THEME_DISCOVERY_RANDOM_STATE = _optional_int(os.environ.get("THEME_DISCOVERY_RANDOM_STATE", "42"))
-CLUSTER_ALGORITHM = os.environ.get("CLUSTER_ALGORITHM", "hdbscan").lower()  # hdbscan or kmeans
-MIN_CLUSTER_SIZE = int(os.environ.get("MIN_CLUSTER_SIZE", "500"))
-MIN_SAMPLES = int(os.environ.get("MIN_SAMPLES", "25"))
-# HDBSCAN-only parameter. Increase slightly, e.g. 0.05-0.30, to merge nearby dense clusters.
-CLUSTER_SELECTION_EPSILON = float(os.environ.get("CLUSTER_SELECTION_EPSILON", "0.25"))
-UMAP_NEIGHBORS = int(os.environ.get("UMAP_NEIGHBORS", "75"))
-UMAP_COMPONENTS = int(os.environ.get("UMAP_COMPONENTS", "10"))
-UMAP_MIN_DIST = float(os.environ.get("UMAP_MIN_DIST", "0.0"))
-# Use None for faster parallel UMAP, or set an integer seed for reproducibility.
-UMAP_RANDOM_STATE = _optional_int(os.environ.get("UMAP_RANDOM_STATE", ""))
-UMAP_N_JOBS = int(os.environ.get("UMAP_N_JOBS", "-1"))
-KMEANS_CLUSTERS = int(os.environ.get("KMEANS_CLUSTERS", "80"))
+
+# Always try to preserve high-value records from selected locations before
+# random sampling lower-priority records.
+POC_ALWAYS_KEEP_EVENT_KINDS = {
+    "serious_injury",
+    "normal_injury",
+    "near_miss",
+    "task_overdue",
+    "task_open",
+}
+POC_ALWAYS_KEEP_MIN_REVIEW_PRIORITY = 4.0
+
+# Location selection weights. These do not become model features; they only
+# choose high-signal locations for the concept-proof sample.
+POC_LOCATION_SCORE_WEIGHTS = {
+    "serious_injury": 30.0,
+    "normal_injury": 10.0,
+    "near_miss": 8.0,
+    "hazard_identification": 2.0,
+    "audit_unsafe_condition": 3.0,
+    "audit_unsafe_act": 3.0,
+    "audit_safe_condition": 1.8,
+    "audit_safe_act": 1.8,
+    "audit_positive_observation": 1.5,
+    "audit_observation": 1.0,
+    "audit_other": 0.7,
+    "task_overdue": 3.0,
+    "task_open": 1.5,
+    "task_other": 0.5,
+}
+
+# Optional old development sample per family after all other filtering. Keep at
+# 0 when POC_MAJOR_LOCATION_SAMPLE is enabled. This is retained for debugging.
+MAX_RECORDS_PER_FAMILY = 0
+
+THEME_INPUT_ALL_FILE = THEME_INPUT_DIR / "theme_input_all.csv"
+THEME_INPUT_FILE_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: THEME_INPUT_DIR / "theme_input_incident_hazard.csv",
+    FAMILY_AUDIT_RISK: THEME_INPUT_DIR / "theme_input_audit_risk.csv",
+    FAMILY_AUDIT_POSITIVE: THEME_INPUT_DIR / "theme_input_audit_positive.csv",
+    FAMILY_TASK_ACTION: THEME_INPUT_DIR / "theme_input_task_action.csv",
+}
+THEME_INPUT_PROFILE_FILE = THEME_INPUT_DIR / "theme_input_profile.csv"
+POC_LOCATION_PROFILE_FILE = THEME_INPUT_DIR / "poc_major_location_profile.csv"
+POC_SELECTED_LOCATIONS_FILE = THEME_INPUT_DIR / "poc_selected_locations.csv"
+POC_SAMPLING_SUMMARY_FILE = THEME_INPUT_DIR / "poc_sampling_summary.json"
+
 
 # ---------------------------------------------------------------------------
-# Step 4: theme assignment
+# Audit-specific clustering controls
 # ---------------------------------------------------------------------------
-THEME_SIMILARITY_THRESHOLD = float(os.environ.get("THEME_SIMILARITY_THRESHOLD", "0.25"))
-ASSIGNMENT_BATCH_SIZE = int(os.environ.get("ASSIGNMENT_BATCH_SIZE", "10000"))
+# Routine scheduled inspections/checklists often dominate audit text and create
+# meaningless clusters. Keep them for accounting, but exclude them from audit
+# text clustering by default.
+# Split audits into: audit_risk, audit_positive, and audit_activity.
+# audit_risk and audit_positive are clustered separately. audit_activity is
+# retained only for accounting.
+AUDIT_CLUSTER_ONLY_MEANINGFUL_FINDINGS = True
+AUDIT_SPLIT_SAFE_AND_UNSAFE_CLUSTERS = True
+AUDIT_INCLUDE_SAFE_ACT_CONDITION_CLUSTERING = True
+AUDIT_WRITE_ACTIVITY_ACCOUNTING = True
+AUDIT_MEANINGFUL_OBSERVATION_MIN_CHARS = 60
+AUDIT_KEEP_NONROUTINE_LONG_OBSERVATIONS = False
+AUDIT_EXCLUDED_SAMPLE_ROWS = 10000
+AUDIT_ELIGIBLE_SAMPLE_ROWS = 10000
+
+# If status/title/text indicates a scheduled/routine inspection and no unsafe
+# signal is present, the record is counted but not embedded/clustered.
+AUDIT_ROUTINE_STATUS_PATTERNS = [
+    r"\bscheduled\b",
+    r"\bprogramad[ao]\b",
+    r"\bplanead[ao]\b",
+]
+
+AUDIT_ROUTINE_TEXT_PATTERNS = [
+    r"\bscheduled\b",
+    r"\bin progress\b",
+    r"\bweekly\b",
+    r"\bmonthly\b",
+    r"\bdaily\b",
+    r"\bcheck\s*list\b",
+    r"\bchecklist\b",
+    r"\binspec(?:ci[oó]n|cion|ion|ci[oó]|ci)\b",
+    r"\binspecci[oó]n\b",
+    r"\binspecion\b",
+    r"\binspecci\b",
+    r"\bauditor[ií]a\b",
+    r"\bmontacargas\b.*\bscheduled\b",
+    r"\bvehicular\b.*\bscheduled\b",
+    r"\binspec(?:ci[oó]n|ion|ci[oó])\s+montacargas\b",
+    r"\binspec(?:ci[oó]n|ion|ci[oó])\s+vehicular\b",
+    r"\bforklift\s+inspection\b",
+    r"\bvehicle\s+inspection\b",
+    r"\btruck\s+inspection\b",
+    r"\bservice\s+truck\b",
+    r"\bsafety\s+observation\s*$",
+    r"\bobservation\s+act\s*$",
+]
+
+# Broad, multilingual indicators that an audit/observation text contains a
+# specific safety finding rather than just an inspection form name. This is not
+# used to define clusters; it is only used to keep meaningful audit records.
+AUDIT_FINDING_SIGNAL_PATTERNS = [
+    r"\bunsafe\b", r"\bhazard\b", r"\brisk\b",
+    r"\bnot\s+wearing\b", r"\bwithout\b", r"\bmissing\b", r"\bno\s+safety\b",
+    r"\bdamaged\b", r"\bbroken\b", r"\bdefective\b", r"\bloose\b", r"\bexposed\b",
+    r"\bspill\b", r"\bleak\b", r"\bblocked\b", r"\bobstruct", r"\btrip\b", r"\bslip\b",
+    r"\bguard\b", r"\bunguarded\b", r"\bcable\b", r"\bcord\b", r"\bwire\b",
+    r"\bppe\b", r"\bepp\b", r"\bsafety\s+glasses\b", r"\bgloves?\b",
+    r"\bhard\s+hat\b", r"\bhelmet\b", r"\bface\s+shield\b", r"\bvest\b",
+    r"\bfalta\b", r"\bsin\b", r"\bno\s+usa", r"\bno\s+usar", r"\blentes\b",
+    r"\bguantes\b", r"\bcasco\b", r"\bcareta\b", r"\bchaleco\b", r"\bderrame\b",
+    r"\bobstru", r"\bdañ", r"\bdanad", r"\broto\b", r"\brota\b", r"\bmal\s+estado\b",
+]
+
+AUDIT_UNSAFE_ACT_PATTERNS = [
+    r"\bunsafe\s+act\b", r"\bnot\s+wearing\b", r"\bwithout\s+(?:ppe|gloves?|safety\s+glasses|hard\s+hat|helmet|vest)\b",
+    r"\bno\s+safety\s+(?:glasses|vest|gloves?)\b", r"\bsin\s+(?:lentes|guantes|casco|chaleco|careta)\b",
+    r"\bfalta\s+de\s+(?:lentes|guantes|casco|chaleco|careta)\b", r"\bno\s+usa", r"\bno\s+usar",
+]
+
+AUDIT_UNSAFE_CONDITION_PATTERNS = [
+    r"\bunsafe\s+condition\b", r"\bdamaged\b", r"\bbroken\b", r"\bdefective\b",
+    r"\bmissing\b", r"\bloose\b", r"\bexposed\b", r"\bspill\b", r"\bleak\b",
+    r"\bblocked\b", r"\bobstruct", r"\btrip\b", r"\bslip\b", r"\bunguarded\b",
+    r"\bderrame\b", r"\bobstru", r"\bdañ", r"\bdanad", r"\broto\b", r"\brota\b",
+]
+
+# Safe/positive observations are valuable control evidence. They are clustered
+# separately from unsafe findings to avoid mixing "wearing PPE" with "not
+# wearing PPE" in the same audit theme.
+AUDIT_SAFE_ACT_PATTERNS = [
+    r"\bsafe\s+act\b", r"\bpositive\s+behavior\b", r"\bproper(?:ly)?\s+(?:wearing|using)\b",
+    r"\bwearing\s+(?:proper\s+)?(?:ppe|gloves?|safety\s+glasses|hard\s+hat|helmet|vest)\b",
+    r"\busing\s+(?:proper\s+)?(?:ppe|fall\s+protection|lockout|loto|guard)\b",
+    r"\bcompliant\b", r"\bcompliance\b", r"\bcorrectly\b", r"\bproper\b",
+    r"\buso\s+correcto\b", r"\busando\b", r"\butiliza\b", r"\bcumple\b", r"\bcumplimiento\b",
+]
+
+AUDIT_SAFE_CONDITION_PATTERNS = [
+    r"\bsafe\s+condition\b", r"\bgood\s+housekeeping\b", r"\bclean\s+(?:area|workplace|floor)\b",
+    r"\bclear\s+(?:walkway|access|aisle)\b", r"\bguard(?:ing)?\s+(?:in\s+place|installed)\b",
+    r"\bbarrier(?:s)?\s+(?:in\s+place|installed)\b", r"\bproper\s+storage\b",
+    r"\bwell\s+maintained\b", r"\bin\s+good\s+condition\b",
+    r"\borden\s+y\s+limpieza\b", r"\blimpio\b", r"\bbuena\s+condici",
+]
+
+AUDIT_POSITIVE_SIGNAL_PATTERNS = AUDIT_SAFE_ACT_PATTERNS + AUDIT_SAFE_CONDITION_PATTERNS
+
+# Remove these from audit model text after eligibility is decided. This prevents
+# clusters from being named after form/template language.
+AUDIT_MODEL_TEXT_REMOVE_PATTERNS = [
+    r"\btitle\s*:", r"\bdescription\s*:", r"\bstatus\s*:",
+    r"\bobservation\s+act\b", r"\bsafety\s+observation\b",
+    r"\bobservation\b", r"\binspection\b", r"\baudit\b", r"\bscheduled\b",
+    r"\binspec(?:ci[oó]n|cion|ion|ci[oó]|ci)\b", r"\binspecion\b", r"\binspecci\b",
+    r"\bclosed\b", r"\bin\s+progress\b", r"\bpending\b",
+]
+
+AUDIT_CLUSTER_STOPWORDS = {
+    "observation", "observations", "act", "acts", "safety", "audit", "audits",
+    "inspection", "inspections", "inspecion", "inspeccion", "inspecci", "scheduled",
+    "closed", "progress", "title", "description", "weekly", "monthly", "daily",
+}
+
+AUDIT_ACTIVITY_ACCOUNTING_FILE = THEME_INPUT_DIR / "audit_activity_accounting.csv"
+AUDIT_CLUSTER_ELIGIBILITY_SUMMARY_FILE = THEME_INPUT_DIR / "audit_cluster_eligibility_summary.csv"
+AUDIT_EXCLUDED_FROM_CLUSTERING_FILE = THEME_INPUT_DIR / "audit_excluded_from_clustering_sample.csv"
+AUDIT_ELIGIBLE_FOR_CLUSTERING_FILE = THEME_INPUT_DIR / "audit_eligible_for_clustering_sample.csv"
+AUDIT_RISK_FOR_CLUSTERING_FILE = THEME_INPUT_DIR / "audit_risk_for_clustering_sample.csv"
+AUDIT_POSITIVE_FOR_CLUSTERING_FILE = THEME_INPUT_DIR / "audit_positive_for_clustering_sample.csv"
 
 # ---------------------------------------------------------------------------
-# Step 5: risk-state dataset
+# Embedding settings
 # ---------------------------------------------------------------------------
-ASOF_FREQUENCY = os.environ.get("ASOF_FREQUENCY", "MS")
-LOOKBACK_WINDOWS = os.environ.get("LOOKBACK_WINDOWS", "30,90,180")
-PREDICTION_HORIZONS = os.environ.get("PREDICTION_HORIZONS", "30,90")
-MIN_HISTORY_EVENTS = int(os.environ.get("MIN_HISTORY_EVENTS", "1"))
+# Preferred backend is sentence_transformers. If unavailable, the code falls
+# back to TF-IDF + SVD embeddings so the pipeline can still run.
+EMBEDDING_BACKEND = "sentence_transformers"  # sentence_transformers or tfidf_svd
+# SENTENCE_TRANSFORMER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Better quality but sometimes slower to download/run:
+SENTENCE_TRANSFORMER_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_BATCH_SIZE = 128
+EMBEDDING_NORMALIZE = True
+EMBEDDING_DEVICE = None  # None=auto, or "cpu", "cuda"
+
+TFIDF_MAX_FEATURES = 50000
+TFIDF_NGRAM_RANGE = (1, 2)
+TFIDF_MIN_DF = 2
+TFIDF_MAX_DF = 0.95
+SVD_COMPONENTS = 256
+
+EMBEDDING_FILE_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: THEME_EMBEDDING_DIR / "embeddings_incident_hazard.npy",
+    FAMILY_AUDIT_RISK: THEME_EMBEDDING_DIR / "embeddings_audit_risk.npy",
+    FAMILY_AUDIT_POSITIVE: THEME_EMBEDDING_DIR / "embeddings_audit_positive.npy",
+    FAMILY_TASK_ACTION: THEME_EMBEDDING_DIR / "embeddings_task_action.npy",
+}
+EMBEDDING_META_FILE_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: THEME_EMBEDDING_DIR / "embedding_meta_incident_hazard.csv",
+    FAMILY_AUDIT_RISK: THEME_EMBEDDING_DIR / "embedding_meta_audit_risk.csv",
+    FAMILY_AUDIT_POSITIVE: THEME_EMBEDDING_DIR / "embedding_meta_audit_positive.csv",
+    FAMILY_TASK_ACTION: THEME_EMBEDDING_DIR / "embedding_meta_task_action.csv",
+}
+EMBEDDING_SUMMARY_FILE = THEME_EMBEDDING_DIR / "embedding_summary.json"
 
 # ---------------------------------------------------------------------------
-# Steps 6-8: model training and explanations
+# Clustering settings
 # ---------------------------------------------------------------------------
-DEFAULT_HORIZON = int(os.environ.get("DEFAULT_HORIZON", "90"))
-TEST_FRAC = float(os.environ.get("TEST_FRAC", "0.20"))
-POSITIVE_QUANTILE = float(os.environ.get("POSITIVE_QUANTILE", "0.90"))
-FIXED_RISK_THRESHOLD = os.environ.get("FIXED_RISK_THRESHOLD")
-FIXED_RISK_THRESHOLD = None if FIXED_RISK_THRESHOLD in {None, ""} else float(FIXED_RISK_THRESHOLD)
-CALIBRATION_FRAC = float(os.environ.get("CALIBRATION_FRAC", "0.20"))
-CALIBRATION_METHOD = os.environ.get("CALIBRATION_METHOD", "isotonic")
-EXPLANATION_SAMPLE_SIZE = int(os.environ.get("EXPLANATION_SAMPLE_SIZE", "500"))
-EXPLANATION_TOP_N = int(os.environ.get("EXPLANATION_TOP_N", "8"))
-EXPLAIN_TOP_PREDICTIONS = os.environ.get("EXPLAIN_TOP_PREDICTIONS", "false").lower() in {"1", "true", "yes", "y"}
-RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+# hdbscan is recommended for discovery. minibatch_kmeans is useful when you
+# need full assignment or the family has very repetitive short text.
+CLUSTER_METHOD_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: "hdbscan",
+    FAMILY_AUDIT_RISK: "hdbscan",
+    FAMILY_AUDIT_POSITIVE: "hdbscan",
+    FAMILY_TASK_ACTION: "minibatch_kmeans",
+}
 
+# Dimensionality reduction before clustering. UMAP works best for HDBSCAN if
+# installed. PCA fallback is automatic if UMAP is not available.
+USE_DIMENSION_REDUCTION = True
+REDUCTION_METHOD = "umap"  # umap or pca
+UMAP_N_NEIGHBORS = 30
+UMAP_N_COMPONENTS = 15
+UMAP_MIN_DIST = 0.0
+UMAP_METRIC = "cosine"
+PCA_N_COMPONENTS = 50
 
-def all_step_dirs() -> list[Path]:
-    return [
-        STEP_00_DIR,
-        STEP_01_DIR,
-        STEP_02_DIR,
-        STEP_03_DIR,
-        STEP_04_DIR,
-        STEP_05_DIR,
-        STEP_06_DIR,
-        STEP_07_DIR,
-        STEP_08_DIR,
-    ]
+# HDBSCAN parameters. Smaller values are suitable for sampled POC runs.
+HDBSCAN_MIN_CLUSTER_SIZE_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: 30,
+    FAMILY_AUDIT_RISK: 35,
+    FAMILY_AUDIT_POSITIVE: 35,
+    FAMILY_TASK_ACTION: 50,
+}
+HDBSCAN_MIN_SAMPLES_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: 8,
+    FAMILY_AUDIT_RISK: 8,
+    FAMILY_AUDIT_POSITIVE: 8,
+    FAMILY_TASK_ACTION: 10,
+}
+HDBSCAN_CLUSTER_SELECTION_METHOD = "eom"
 
+# KMeans parameters. Used for families configured as minibatch_kmeans or as a
+# fallback when HDBSCAN is unavailable.
+KMEANS_N_CLUSTERS_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: 60,
+    FAMILY_AUDIT_RISK: 50,
+    FAMILY_AUDIT_POSITIVE: 50,
+    FAMILY_TASK_ACTION: 70,
+}
+KMEANS_BATCH_SIZE = 4096
+KMEANS_MAX_ITER = 200
 
-def print_config_summary() -> None:
-    print("Audits/tasks modeling configuration")
-    print(f"  PROJECT_ROOT: {PROJECT_ROOT}")
-    print(f"  DATA_DIR: {DATA_DIR}")
-    print(f"  OUTPUT_ROOT: {OUTPUT_ROOT}")
-    print(f"  EMBEDDING_PROVIDER: {EMBEDDING_PROVIDER}")
-    print(f"  EMBEDDING_MODEL_NAME: {EMBEDDING_MODEL_NAME}")
-    print(f"  TAG_BACKEND: {TAG_BACKEND}")
-    print(f"  DEFAULT_HORIZON: {DEFAULT_HORIZON}")
+# If HDBSCAN labels records as noise, optionally assign them to the nearest
+# strong cluster centroid if the cosine similarity is high enough.
+ASSIGN_HDBSCAN_NOISE_TO_NEAREST_THEME = True
+NEAREST_THEME_MIN_COSINE_SIMILARITY = 0.55
+
+# If a family is still large after POC sampling, fit HDBSCAN on a sample and
+# assign the rest by nearest centroid. 0 means fit on all family records.
+CLUSTER_FIT_MAX_RECORDS_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: 0,
+    FAMILY_AUDIT_RISK: 0,
+    FAMILY_AUDIT_POSITIVE: 0,
+    FAMILY_TASK_ACTION: 0,
+}
+
+THEME_ASSIGNMENTS_FILE = THEME_CLUSTER_DIR / "event_theme_assignments.csv"
+CLUSTER_SUMMARY_FILE = THEME_CLUSTER_DIR / "cluster_run_summary.json"
+ASSIGNMENT_FILE_BY_FAMILY = {
+    FAMILY_INCIDENT_HAZARD: THEME_CLUSTER_DIR / "event_theme_assignments_incident_hazard.csv",
+    FAMILY_AUDIT_RISK: THEME_CLUSTER_DIR / "event_theme_assignments_audit_risk.csv",
+    FAMILY_AUDIT_POSITIVE: THEME_CLUSTER_DIR / "event_theme_assignments_audit_positive.csv",
+    FAMILY_TASK_ACTION: THEME_CLUSTER_DIR / "event_theme_assignments_task_action.csv",
+}
+THEME_CENTROID_FILE = THEME_CLUSTER_DIR / "theme_centroids.npy"
+THEME_CENTROID_META_FILE = THEME_CLUSTER_DIR / "theme_centroid_meta.csv"
+
+# ---------------------------------------------------------------------------
+# Labeling / catalog settings
+# ---------------------------------------------------------------------------
+TOP_TERMS_PER_THEME = 20
+REPRESENTATIVE_EXAMPLES_PER_THEME = 10
+RANDOM_EXAMPLES_PER_THEME = 5
+MAX_REPRESENTATIVE_TEXT_CHARS = 700
+LABEL_TOP_TERM_COUNT = 4
+MIN_THEME_SIZE_FOR_CATALOG = 3
+
+THEME_CATALOG_FILE = THEME_CATALOG_DIR / "theme_catalog.csv"
+THEME_REPRESENTATIVE_EXAMPLES_FILE = THEME_CATALOG_DIR / "theme_representative_examples.csv"
+THEME_CATALOG_REVIEW_FILE = THEME_CATALOG_DIR / "theme_catalog_review.csv"
+
+# ---------------------------------------------------------------------------
+# Location/theme period profiles
+# ---------------------------------------------------------------------------
+PROFILE_PERIOD_FREQ = "Y"  # Y, Q, M, W
+LOCATION_THEME_PERIOD_FILE = THEME_PROFILE_DIR / f"location_theme_period_profile_{PROFILE_PERIOD_FREQ}.csv"
+LOCATION_PERIOD_TOP_THEMES_FILE = THEME_PROFILE_DIR / f"location_period_top_themes_{PROFILE_PERIOD_FREQ}.csv"
+THEME_PERIOD_TRENDS_FILE = THEME_PROFILE_DIR / f"theme_period_trends_{PROFILE_PERIOD_FREQ}.csv"
+LOCATION_THEME_ROLLUP_FILE = THEME_PROFILE_DIR / "location_theme_rollup.csv"
+TOP_THEMES_PER_LOCATION_PERIOD = 10
+
+# ---------------------------------------------------------------------------
+# Cross-family link settings
+# ---------------------------------------------------------------------------
+# Candidate links are not causal links. They are review candidates based on
+# theme centroid similarity and location-period co-occurrence.
+ENABLE_CROSS_FAMILY_LINKS = True
+LINK_MIN_COSINE_SIMILARITY = 0.45
+LINK_MIN_COOCCURRENCE_COUNT = 2
+LINK_MAX_PAIRS_PER_SOURCE_THEME = 10
+LINK_SCORE_SIMILARITY_WEIGHT = 0.65
+LINK_SCORE_COOCCURRENCE_WEIGHT = 0.35
+CROSS_FAMILY_LINKS_FILE = THEME_LINK_DIR / f"cross_family_theme_links_{PROFILE_PERIOD_FREQ}.csv"
+LOCATION_DOMAIN_CANDIDATE_FILE = THEME_LINK_DIR / f"location_period_cross_family_candidates_{PROFILE_PERIOD_FREQ}.csv"
+
+# ---------------------------------------------------------------------------
+# Text cleaning / generic words
+# ---------------------------------------------------------------------------
+CUSTOM_STOPWORDS = {
+    "title", "description", "activity", "activityduringincident", "immediateaction",
+    "immediatecauses", "causalfactors", "bestpractices", "riskaction", "riskcondition",
+    "status", "closed", "pending", "closure", "investigation", "record", "records",
+    "employee", "worker", "person", "people", "reported", "report", "taken", "action",
+    "area", "work", "working", "process", "incident", "near", "miss", "hazard",
+    "audit", "task", "inspection", "observation", "observations", "condition", "safe", "unsafe", "komatsu",
+    "immediately", "immediate", "pictures", "photo", "photos", "supervisor", "management",
+    "approximately", "relevant", "stakeholder", "stakeholders", "department",
+}
+
+# Keep these strings out of theme text because they are source-system boilerplate.
+
+CUSTOM_STOPWORDS |= {
+    "observation", "observations", "observed", "observe", "observacion",
+    "observación", "observa", "observação", "seguridad", "seguranca",
+    "segurança", "act", "acts", "scheduled", "schedule", "weekly",
+    "monthly", "daily", "checklist", "template", "inspeccion",
+    "inspección", "inspecion", "inspecci", "consigna", "buena",
+    "vista", "progress", "review", "prior", "version", "published",
+}
+
+# Keep these strings out of theme text because they are source-system boilerplate.
+BOILERPLATE_PATTERNS = [
+    "title:", "description:", "activityduringincident:", "immediateaction:",
+    "immediatecauses:", "causalfactors:", "bestpractices:", "riskaction:",
+    "riskcondition:", "offpremiseslocation:", "otherlocation:", "equipment:",
+    "vehicle:", "source:", "task:", "comments:", "associatedparties:",
+]
+
+# Backward-compatible names used by the audit filtering code.
+AUDIT_ROUTINE_EXCLUDE_PATTERNS = AUDIT_ROUTINE_TEXT_PATTERNS + AUDIT_ROUTINE_STATUS_PATTERNS
+AUDIT_GENERIC_TITLE_PATTERNS = [
+    r"^\s*(?:safety\s+observation|observation\s+act|observation|inspection|inspeccion|inspecion|inspecci)\s*$",
+    r"^\s*(?:weekly|monthly|daily)\s+(?:inspection|observation)\s*$",
+]
+AUDIT_RISK_KEYWORD_PATTERNS = AUDIT_FINDING_SIGNAL_PATTERNS
+AUDIT_POSITIVE_KEYWORD_PATTERNS = AUDIT_POSITIVE_SIGNAL_PATTERNS
+AUDIT_THEME_TEXT_REMOVE_PATTERNS = AUDIT_MODEL_TEXT_REMOVE_PATTERNS
+AUDIT_MIN_CLUSTER_TEXT_CHARS = 25
+AUDIT_MIN_MEANINGFUL_OBSERVATION_CHARS = AUDIT_MEANINGFUL_OBSERVATION_MIN_CHARS
+AUDIT_INCLUDE_UNSAFE_FINDINGS_WITH_GENERIC_TEXT = False
+AUDIT_INCLUDE_GENERAL_OBSERVATIONS_WITH_RISK_KEYWORDS = True
+AUDIT_EXCLUDE_SAFE_POSITIVE_OBSERVATIONS_FROM_CLUSTERING = False  # safe observations are clustered separately as audit_positive
+AUDIT_KEEP_ROUTINE_INSPECTIONS_FOR_ACCOUNTING = True
+AUDIT_CLUSTER_EXCLUDED_FILE = AUDIT_EXCLUDED_FROM_CLUSTERING_FILE
+AUDIT_CLUSTER_ELIGIBILITY_PROFILE_FILE = AUDIT_CLUSTER_ELIGIBILITY_SUMMARY_FILE
