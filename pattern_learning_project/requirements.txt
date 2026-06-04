@@ -27,6 +27,8 @@ tokenizers==0.19.1
 safetensors>=0.4.4
 sentencepiece>=0.2.0
 protobuf>=4.25
+accelerate>=0.30
+
 
 # PyTorch
 # CPU is fine for the local summarization scripts.
@@ -37,6 +39,5 @@ sentence-transformers>=2.7.0
 umap-learn>=0.5.5
 hdbscan>=0.8
 faiss-cpu>=1.8
-
-# Language detection for optional English-only Step 00 filtering
-langdetect>=1.0.9
+# Optional but recommended for BAAI/bge-m3 dense embeddings:
+FlagEmbedding>=1.2.10
