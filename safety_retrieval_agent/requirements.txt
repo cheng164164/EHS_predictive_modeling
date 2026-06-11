@@ -12,6 +12,12 @@ safetensors>=0.4
 sentencepiece>=0.2.0
 protobuf>=4.25
 faiss-cpu>=1.8.0
-# Optional only. Default backend uses sentence-transformers for BGE-M3 and Qwen3 fallback.
-# Install/use only if you specifically set embedding_backend="flagembedding".
-# FlagEmbedding>=1.2.10
+
+# Local dependencies for submitting Azure ML jobs from VS Code / Azure ML notebooks.
+# Install in the environment where you run scripts/submit_azureml_*.py.
+azure-ai-ml>=1.18.0
+azure-identity>=1.16.0
+
+# Extra runtime dependencies for direct Azure ML datastore artifact reads.
+azureml-fsspec>=1.3.1
+fsspec>=2023.10.0

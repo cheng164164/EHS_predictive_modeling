@@ -17,7 +17,8 @@ from scipy import sparse
 from sklearn.feature_extraction.text import CountVectorizer
 
 from .config import Settings
-from .utils import clean_text_value, ensure_dir, load_json, save_json
+from .artifact_io import artifact_exists, artifact_join, load_joblib, load_numpy, read_json
+from .utils import clean_text_value, ensure_dir, save_json
 
 
 @dataclass
@@ -116,15 +117,16 @@ def save_bm25_store(store: BM25Store, output_dir: Path) -> None:
     save_json(store.metadata, output_dir / "bm25_metadata.json")
 
 
-def load_bm25_store(output_dir: Path) -> BM25Store:
-    metadata_path = output_dir / "bm25_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"BM25 index metadata not found: {metadata_path}. Run scripts/01_build_faiss_indexes.py first.")
-    vectorizer = joblib.load(output_dir / "bm25_vectorizer.joblib")
-    matrix_csc = joblib.load(output_dir / "bm25_matrix_csc.joblib")
-    doc_len = np.load(output_dir / "bm25_doc_len.npy")
-    idf = np.load(output_dir / "bm25_idf.npy")
-    metadata = load_json(metadata_path)
+def load_bm25_store(output_dir: Path | str) -> BM25Store:
+    """Load the BM25 store from a local folder or Azure ML datastore URI."""
+    metadata_path = artifact_join(output_dir, "bm25_metadata.json")
+    if not artifact_exists(metadata_path):
+        raise FileNotFoundError(f"BM25 index metadata not found: {metadata_path}. Run index build first.")
+    vectorizer = load_joblib(artifact_join(output_dir, "bm25_vectorizer.joblib"))
+    matrix_csc = load_joblib(artifact_join(output_dir, "bm25_matrix_csc.joblib"))
+    doc_len = load_numpy(artifact_join(output_dir, "bm25_doc_len.npy"))
+    idf = load_numpy(artifact_join(output_dir, "bm25_idf.npy"))
+    metadata = read_json(metadata_path)
     return BM25Store(
         vectorizer=vectorizer,
         matrix_csc=matrix_csc,
@@ -144,13 +146,13 @@ def save_bm25_subset(output_dir: Path, name: str, row_ids: np.ndarray, metadata:
     return meta
 
 
-def load_bm25_subset(output_dir: Path, name: str) -> tuple[np.ndarray, dict]:
-    row_id_path = output_dir / f"{name}_row_ids.npy"
-    metadata_path = output_dir / f"{name}_metadata.json"
-    if not row_id_path.exists():
+def load_bm25_subset(output_dir: Path | str, name: str) -> tuple[np.ndarray, dict]:
+    row_id_path = artifact_join(output_dir, f"{name}_row_ids.npy")
+    metadata_path = artifact_join(output_dir, f"{name}_metadata.json")
+    if not artifact_exists(row_id_path):
         raise FileNotFoundError(f"BM25 subset row IDs not found: {row_id_path}")
-    row_ids = np.load(row_id_path)
-    metadata = load_json(metadata_path) if metadata_path.exists() else {"name": name, "row_count": int(len(row_ids))}
+    row_ids = load_numpy(row_id_path)
+    metadata = read_json(metadata_path) if artifact_exists(metadata_path) else {"name": name, "row_count": int(len(row_ids))}
     return row_ids, metadata
 
 

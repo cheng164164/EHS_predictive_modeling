@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 from _bootstrap import PROJECT_ROOT  # noqa: F401
-from safety_retrieval_agent.agent import SafetyRetrievalAgent
+from safety_retrieval_agent.agent import SafetyRetrievalAgent, save_analysis_test_outputs
 from safety_retrieval_agent.config import get_settings
 from safety_retrieval_agent.utils import ensure_dir, save_json
 
@@ -31,8 +31,15 @@ def main() -> dict:
     )
     out_path = settings.recommendations_dir() / "single_event_analysis.json"
     save_json(result, out_path)
-    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
-    print(f"Saved: {out_path}")
+    test_manifest = save_analysis_test_outputs(
+        result,
+        settings.tests_dir(),
+        run_name="single_event",
+        query_id=settings.single_event_id or "manual_query",
+    )
+    print(json.dumps(result.get("user_facing_final_response", result), indent=2, ensure_ascii=False, default=str))
+    print(f"Saved full analysis: {out_path}")
+    print(f"Saved step-by-step test outputs: {test_manifest['output_dir']}")
     return result
 
 

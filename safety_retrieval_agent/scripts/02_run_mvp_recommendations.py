@@ -15,9 +15,10 @@ import time
 import pandas as pd
 
 from _bootstrap import PROJECT_ROOT  # noqa: F401
-from safety_retrieval_agent.agent import SafetyRetrievalAgent, flatten_analysis_for_csv
+from safety_retrieval_agent.agent import SafetyRetrievalAgent, build_analysis_test_outputs, flatten_analysis_for_csv
+from safety_retrieval_agent.artifact_io import artifact_exists, read_pickle
 from safety_retrieval_agent.config import get_settings
-from safety_retrieval_agent.utils import clean_text_value, ensure_dir, save_json
+from safety_retrieval_agent.utils import clean_text_value, ensure_dir, json_default, save_json
 
 
 def _load_queries(settings) -> pd.DataFrame:
@@ -41,10 +42,13 @@ def _load_queries(settings) -> pd.DataFrame:
             raise ValueError("Query file must contain query_text, retrieval_text, clean_text, description, or title.")
         return df
 
-    kb_path = settings.enriched_knowledge_base_path() if settings.enriched_knowledge_base_path().exists() else settings.knowledge_base_path()
-    if not kb_path.exists():
-        raise FileNotFoundError("Knowledge base not found. Run scripts/00_prepare_knowledge_base.py and scripts/01_build_faiss_indexes.py first.")
-    df = pd.read_pickle(kb_path)
+    kb_path = settings.artifact_enriched_knowledge_base_path() if hasattr(settings, "artifact_enriched_knowledge_base_path") else settings.enriched_knowledge_base_path()
+    if not artifact_exists(kb_path):
+        kb_path = settings.artifact_knowledge_base_path() if hasattr(settings, "artifact_knowledge_base_path") else settings.knowledge_base_path()
+    if not artifact_exists(kb_path):
+        raise FileNotFoundError(f"Knowledge base not found at artifact path: {kb_path}. Check config.py artifact_azureml_uri.")
+    print(f"[02] Loading query source records from: {kb_path}", flush=True)
+    df = read_pickle(kb_path)
     # Default batch examples come from leading/prevention records only. If the
     # enriched knowledge base exists, it has already been filtered to the embedding
     # scope by scripts/01_build_faiss_indexes.py.
@@ -74,8 +78,23 @@ def main() -> dict:
     agent = SafetyRetrievalAgent(settings)
 
     jsonl_path = settings.recommendations_dir() / "mvp1_recommendation_results.jsonl"
+
+    test_dir = ensure_dir(settings.tests_dir() / "mvp_recommendations")
+    raw_debug_path = test_dir / "raw_retrieval_debug.jsonl"
+    evidence_summary_path = test_dir / "structured_evidence_summary.jsonl"
+    response_plan_path = test_dir / "structured_response_plan.jsonl"
+    user_response_jsonl_path = test_dir / "user_facing_final_response.jsonl"
+    user_response_csv_path = test_dir / "user_facing_final_response.csv"
+
     summary_rows = []
-    with jsonl_path.open("w", encoding="utf-8") as f:
+    user_response_rows = []
+    with (
+        jsonl_path.open("w", encoding="utf-8") as f,
+        raw_debug_path.open("w", encoding="utf-8") as raw_f,
+        evidence_summary_path.open("w", encoding="utf-8") as evidence_f,
+        response_plan_path.open("w", encoding="utf-8") as plan_f,
+        user_response_jsonl_path.open("w", encoding="utf-8") as user_f,
+    ):
         for i, row in queries.iterrows():
             query_text = clean_text_value(row.get("query_text"))
             if not query_text:
@@ -88,18 +107,41 @@ def main() -> dict:
                 event_id=row.get("event_id"),
             )
             f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
+            test_outputs = build_analysis_test_outputs(result)
+            raw_f.write(json.dumps(test_outputs["raw_retrieval_debug"], ensure_ascii=False, default=json_default) + "\n")
+            evidence_f.write(json.dumps(test_outputs["structured_evidence_summary"], ensure_ascii=False, default=json_default) + "\n")
+            plan_f.write(json.dumps(test_outputs["structured_response_plan"], ensure_ascii=False, default=json_default) + "\n")
+            user_f.write(json.dumps(test_outputs["user_facing_final_response"], ensure_ascii=False, default=json_default) + "\n")
             summary_rows.append(flatten_analysis_for_csv(result))
+            user_response_rows.append({
+                "event_id": result.get("query", {}).get("event_id"),
+                "source_type": result.get("query", {}).get("source_type"),
+                "site": result.get("query", {}).get("site"),
+                "department": result.get("query", {}).get("department"),
+                "risk_theme_id": result.get("user_facing_final_response", {}).get("risk_theme_id"),
+                "risk_theme_name": result.get("user_facing_final_response", {}).get("risk_theme_name"),
+                "response_status": result.get("user_facing_final_response", {}).get("response_status"),
+                "llm_model_name": result.get("user_facing_final_response", {}).get("llm_model_name"),
+                "response_text": result.get("user_facing_final_response", {}).get("response_text"),
+            })
             if (i + 1) % 10 == 0:
                 print(f"[02] Analyzed {i + 1:,}/{len(queries):,}", flush=True)
 
     summary_df = pd.DataFrame(summary_rows)
     csv_path = settings.recommendations_dir() / "mvp1_recommendation_summary.csv"
     summary_df.to_csv(csv_path, index=False)
+    pd.DataFrame(user_response_rows).to_csv(user_response_csv_path, index=False)
     summary = {
         "query_count": int(len(queries)),
         "analyzed_count": int(len(summary_rows)),
         "jsonl_output": str(jsonl_path),
         "csv_output": str(csv_path),
+        "tests_output_dir": str(test_dir),
+        "raw_retrieval_debug_jsonl": str(raw_debug_path),
+        "structured_evidence_summary_jsonl": str(evidence_summary_path),
+        "structured_response_plan_jsonl": str(response_plan_path),
+        "user_facing_final_response_jsonl": str(user_response_jsonl_path),
+        "user_facing_final_response_csv": str(user_response_csv_path),
         "elapsed_seconds": round(time.time() - start, 2),
     }
     save_json(summary, settings.recommendations_dir() / "mvp1_recommendation_run_summary.json")

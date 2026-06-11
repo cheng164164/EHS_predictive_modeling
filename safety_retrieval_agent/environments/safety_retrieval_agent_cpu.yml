@@ -1,0 +1,41 @@
+name: safety-retrieval-agent-cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Core data processing
+      - pandas>=2.0
+      - numpy>=1.24
+      - pyarrow>=14.0
+      - tabulate
+      - tqdm>=4.65
+      - joblib>=1.3
+      # Visualization / ML utilities used by existing project scripts
+      - matplotlib>=3.7
+      - scikit-learn>=1.2
+      - lightgbm>=4.0
+      - shap>=0.44
+      # Optional OpenAI support for older scripts
+      - openai>=1.0
+      # Hugging Face stack pinned conservatively to match the existing project
+      # and avoid transformers 5.x incompatibilities.
+      - transformers==4.44.2
+      - huggingface_hub==0.24.6
+      - tokenizers==0.19.1
+      - safetensors>=0.4.4
+      - sentencepiece>=0.2.0
+      - protobuf>=4.25
+      - accelerate>=0.30
+      # PyTorch CPU execution
+      - torch>=2.0.0
+      # Sentence embeddings + retrieval
+      - sentence-transformers>=2.7.0
+      - faiss-cpu>=1.8
+      # Pattern learning / theme discovery
+      - umap-learn>=0.5.5
+      - hdbscan>=0.8
+      # Optional BGE-M3 FlagEmbedding path; not required for the default
+      # sentence_transformers backend.
+      - FlagEmbedding>=1.2.10

@@ -20,6 +20,7 @@ from safety_retrieval_agent.embedding import TextEmbedder
 from safety_retrieval_agent.bm25_store import build_bm25_store, save_bm25_store, save_bm25_subset
 from safety_retrieval_agent.faiss_store import build_and_save_subset_index
 from safety_retrieval_agent.theme import build_theme_profiles, discover_themes, save_theme_model
+from safety_retrieval_agent.index_pipeline import build_retrieval_index_masks
 from safety_retrieval_agent.utils import chunk_ranges, ensure_dir, load_json, save_json
 
 
@@ -51,8 +52,13 @@ def _metadata_looks_compatible(metadata: dict, settings, record_count: int, shap
     if len(shape) != 2 or int(shape[0]) != int(record_count):
         return False
     # The actual model can be primary or fallback. Reuse is only safe when the
-    # metadata tells us what model created the vectors.
-    return bool(metadata.get("embedding_model_name")) and bool(metadata.get("embedding_backend"))
+    # metadata tells us what model created the vectors and the stored requested
+    # primary model/backend match the current config.
+    if not (metadata.get("embedding_model_name") and metadata.get("embedding_backend")):
+        return False
+    stored_primary_model = str(metadata.get("primary_embedding_model_name") or metadata.get("embedding_model_name") or "")
+    stored_primary_backend = str(metadata.get("primary_embedding_backend") or metadata.get("embedding_backend") or "")
+    return stored_primary_model == str(settings.embedding_model_name) and stored_primary_backend == str(settings.embedding_backend)
 
 
 def _nonempty_description_mask(records: pd.DataFrame, settings) -> pd.Series:
@@ -273,19 +279,9 @@ def main() -> dict:
     records.to_pickle(settings.enriched_knowledge_base_path())
     records.to_csv(settings.enriched_knowledge_base_path().with_suffix(".csv.gz"), index=False, compression="gzip")
 
-    role = records["source_role"].fillna("").astype(str)
-    source_type = records["source_type"].fillna("").astype(str)
-    masks = {
-        # all_events means all records inside the configured embedding/retrieval scope,
-        # not every record from the raw unified file.
-        "all_events": np.ones(len(records), dtype=bool),
-        "severe_injuries": role.eq("severe_injury").to_numpy(),
-        "all_injuries": role.isin(["injury", "severe_injury"]).to_numpy(),
-        "leading_events": role.isin(["hazard_identification", "near_miss", "unsafe_observation", "safe_observation", "audit_observation"]).to_numpy(),
-        "corrective_actions": source_type.eq("task").to_numpy(),
-        "safe_observations": role.eq("safe_observation").to_numpy(),
-        "unsafe_observations": role.eq("unsafe_observation").to_numpy(),
-    }
+    masks = build_retrieval_index_masks(records)
+    configured_index_names = list(getattr(settings, "retrieval_index_names", masks.keys()))
+    masks = {name: masks[name] for name in configured_index_names if name in masks}
 
     index_summaries = []
     bm25_subset_summaries = []

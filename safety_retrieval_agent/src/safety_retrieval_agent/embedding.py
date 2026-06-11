@@ -256,6 +256,7 @@ class TextEmbedder:
         return {
             "embedding_model_name": self.model_name,
             "embedding_backend": self.actual_backend,
+            "embedding_model_choice": getattr(self.settings, "embedding_model_choice", None),
             "primary_embedding_model_name": self.primary_model_name,
             "primary_embedding_backend": self.backend,
             "fallback_embedding_model_name": self.fallback_model_name or None,
