@@ -1,0 +1,121 @@
+project_name: fine_tune_model
+seed: 42
+paths:
+  input_csv: data/safety_text_event.csv.gz
+  output_dir: ./outputs
+  prepared_dir: ./outputs/prepared
+  model_dir: ./outputs/model
+  eval_dir: ./outputs/eval
+  taxonomy_file: ./configs/hazard_taxonomy.yaml
+
+sampling:
+  max_rows_read: 1000000
+  reuse_existing_sampled_records: false
+  max_examples_total: 3000
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  min_text_length: 100
+  max_text_chars: 2400
+  prefer_english_only: false
+  dedupe_on_normalized_text: true
+  source_type_targets:
+    incident: 750
+    near_miss: 500
+    hazard_identification: 900
+    audit: 400
+    task: 450
+
+labeling:
+  taxonomy:
+    enabled: true
+    min_keyword_score: 1
+    phrase_weight: 2.0
+  clustering:
+    enabled: true
+    method: tfidf_kmeans
+    cluster_by_source_type: true
+    max_records: 15000
+    n_clusters: 12
+    n_clusters_by_source_type:
+      incident: 16
+      near_miss: 12
+      hazard_identification: 16
+      audit: 10
+      task: 10
+    max_features: 12000
+    min_df: 3
+    max_df: 0.60
+    ngram_range: [1, 2]
+    top_terms_per_cluster: 10
+    min_cluster_size_for_label: 5
+    use_stemming: true
+  light_llm:
+    enabled: true
+    # Default is suitable for the V100 GPU cluster. Override this with any HF model.
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    cpu_fallback_model: google/flan-t5-base
+    auto_fallback_to_cpu_model: true
+    trust_remote_code: false
+    # Number of meaningful records to label. The script scans the train file and skips weak records.
+    max_records: 800
+    max_candidate_scan: 5000
+    min_meaningful_text_chars: 140
+    min_alpha_words: 12
+    skip_low_information_sources: false
+    max_prompt_chars: 1800
+    max_new_tokens: 384
+    batch_size_gpu: 2
+    batch_size_cpu: 1
+    progress_interval: 25
+    merge_into_assistant_output: false
+    merge_min_confidence: medium
+    output_raw_file: safety_instruction_train_with_light_llm_raw.jsonl
+    output_merged_file: safety_instruction_train_with_light_llm_merged.jsonl
+    skipped_file: light_llm_skipped_records.jsonl
+    rejected_file: light_llm_rejected_labels.jsonl
+
+training:
+  # Default for your tan-dev-gpu cluster: Standard_NC6s_v3, 1 x NVIDIA Tesla V100, 16GB GPU memory.
+  base_model: Qwen/Qwen2.5-1.5B-Instruct
+  cpu_fallback_model: Qwen/Qwen2.5-0.5B-Instruct
+  auto_fallback_to_cpu_model: true
+  trust_remote_code: false
+  output_model_name: safety-risk-qwen-lora
+  max_seq_length: 1536
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  max_train_samples: 2400
+  max_eval_samples: 300
+  use_4bit: true
+  force_cpu: false
+  gradient_checkpointing: true
+  train_file: safety_instruction_train.jsonl
+  # After you trust 02 output, switch this to safety_instruction_train_with_light_llm_merged.jsonl
+  val_file: safety_instruction_val.jsonl
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+
+evaluation:
+  max_test_samples: 150
+  max_new_tokens: 350
+  temperature: 0.1
+
+azureml:
+  subscription_id: 7f07baf7-8bba-4b88-b300-74ba5b15f52d
+  resource_group: ehs-safety
+  workspace_name: ehs-safety-aml
+  compute: tan-dev-gpu
+  experiment_name: safety_fine_tune_qwen
+  environment:
+    image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04
+    conda_file: azureml/conda.yml
+  job_name_prefix: safety-ft-qwen

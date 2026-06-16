@@ -1,0 +1,50 @@
+# Core data processing
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0
+tabulate
+tqdm>=4.65
+joblib>=1.3
+tabulate
+# Visualization
+matplotlib>=3.7
+
+# Machine learning
+scikit-learn>=1.2
+
+lightgbm>=4.0
+shap>=0.44
+
+# Optional OpenAI support for older scripts
+# Not used by local_transformer_summary by default
+openai>=1.0
+
+# Local transformer / Hugging Face stack
+# Pinned to avoid transformers 5.x incompatibilities.
+transformers==4.44.2
+huggingface_hub==0.24.6
+tokenizers==0.19.1
+safetensors>=0.4.4
+sentencepiece>=0.2.0
+protobuf>=4.25
+accelerate>=0.30
+
+
+# PyTorch
+# CPU is fine for the local summarization scripts.
+torch>=2.0.0
+
+# Sentence embeddings + unsupervised pattern learning
+sentence-transformers>=2.7.0
+umap-learn>=0.5.5
+hdbscan>=0.8
+faiss-cpu>=1.8
+
+# Local dependencies for submitting Azure ML jobs from VS Code / Azure ML notebooks.
+# Install in the environment where you run scripts/submit_azureml_*.py.
+azure-ai-ml>=1.18.0
+azure-identity>=1.16.0
+
+# Extra runtime dependencies for direct Azure ML datastore artifact reads.
+azureml-fsspec>=1.3.1
+fsspec>=2023.10.0

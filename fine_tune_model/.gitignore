@@ -1,0 +1,21 @@
+# raw data
+data/raw/
+*.csv
+*.parquet
+
+# outputs
+outputs/
+
+# models
+models/
+*.joblib
+*.pkl
+
+# AML
+.azureml/
+aml_config/
+
+# python cache
+__pycache__/
+*.pyc
+.venv/

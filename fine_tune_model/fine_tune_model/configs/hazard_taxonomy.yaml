@@ -1,0 +1,325 @@
+# Editable weak-label taxonomy for safety fine-tuning data preparation.
+# This is not a regulatory taxonomy. Treat it as seed labeling guidance that should be reviewed by EHS SMEs.
+
+text_cleaning:
+  # Terms below are removed from clustering labels and vectorization because they usually describe exported field names,
+  # generic roles, or boilerplate rather than the actual hazard pattern.
+  custom_stopwords:
+    - title
+    - description
+    - immediateaction
+    - immediate
+    - action
+    - offpremiseslocation
+    - location
+    - incident
+    - employee
+    - employees
+    - worker
+    - workers
+    - observed
+    - observation
+    - reported
+    - report
+    - task
+    - audit
+    - inspection
+    - inspect
+    - inspected
+    - corrective
+    - correction
+    - issue
+    - area
+    - work
+    - working
+    - workplace
+    - safety
+    - safe
+    - unsafe
+    - condition
+    - conditions
+    - good
+    - proper
+    - follow
+    - following
+    - review
+    - found
+    - noted
+    - during
+    - use
+    - using
+    - used
+    - needs
+    - required
+    - requested
+    - solicita
+    - solicitud
+    - descripcion
+    - descripción
+    - titulo
+    - título
+    - empleado
+    - trabajador
+    - trabajadores
+    - área
+    - zona
+    - trabajo
+    - tarea
+    - auditoria
+    - auditoría
+    - inspeccion
+    - inspección
+    - observacion
+    - observación
+    - reporte
+    - reportado
+    - seguro
+    - inseguro
+    - condición
+    - condiciones
+    - se
+    - la
+    - el
+    - los
+    - las
+    - del
+    - al
+    - en
+    - para
+    - por
+    - con
+    - sin
+    - que
+    - un
+    - una
+    - na
+    - n/a
+    - ee
+    - cm
+    - mm
+    - 2024
+    - 2025
+    - 2026
+
+    - hazard
+    - hazards
+    - check
+    - checked
+    - need
+    - needed
+    - make
+    - sure
+    - did
+    - act
+    - uso
+    - usa
+    - usar
+    - usando
+    - realiza
+    - realizo
+    - realizado
+    - observa
+    - observado
+    - colaborador
+    - personal
+    - correcta
+    - correcto
+    - semanal
+    - weekly
+    - monthly
+  field_noise_regexes:
+    - '(?i)\btitle\b\s*[:=-]?'
+    - '(?i)\bdescription\b\s*[:=-]?'
+    - '(?i)\bimmediate\s*action\b\s*[:=-]?'
+    - '(?i)\boff\s*premises\s*location\b\s*[:=-]?'
+
+hazard_families:
+  - name: mobile equipment / pedestrian interaction
+    consequence: struck-by or caught-between injury, including serious injury potential
+    severity_hint: high
+    keywords: [forklift, forklifts, lift truck, hilo, montacargas, vehicle, truck, trailer, loader, skid steer, mobile equipment, backing, reversing, reverse, blind spot, traffic, pedestrian, walkway, dock, loading dock, yard, aisle, parking lot, spotter]
+    actions:
+      - Review pedestrian and mobile-equipment separation controls in the affected area.
+      - Verify traffic routes, blind spots, right-of-way rules, speed controls, and reversing controls.
+      - Check whether related traffic-flow corrective actions are open, overdue, or recurring.
+      - Perform a focused observation of mobile-equipment and pedestrian interactions.
+
+  - name: crane / hoist / rigging / suspended load
+    consequence: struck-by, caught-between, dropped-load, or crush injury
+    severity_hint: high
+    keywords: [crane, overhead crane, bridge crane, hoist, rigging, sling, slings, chain, hook, load, suspended load, lifting device, spreader bar, boom, pendant, remote, shackle]
+    actions:
+      - Verify lifting plan, rigging condition, rated capacity, and exclusion-zone controls.
+      - Inspect slings, hooks, shackles, chains, and lifting devices before reuse.
+      - Confirm operators and riggers are qualified for the lift.
+      - Review whether people were exposed under or near suspended loads.
+
+  - name: electrical exposure / energy control
+    consequence: shock, arc flash, burn, or serious injury
+    severity_hint: high
+    keywords: [electrical, electric, energized, live, panel, breaker, disconnect, voltage, high voltage, wiring, wire, cable, cord, outlet, plug, arc flash, loto, lockout, tagout, isolation, energy isolation, fuse]
+    actions:
+      - Secure the electrical hazard and restrict access until reviewed by qualified personnel.
+      - Verify energy isolation, LOTO requirements, and electrical guarding.
+      - Inspect similar panels, cords, cables, or disconnects for the same exposure.
+      - Confirm only qualified personnel perform energized or diagnostic work.
+
+  - name: working at height / fall exposure
+    consequence: fall from height with serious injury potential
+    severity_hint: high
+    keywords: [height, fall from height, ladder, scaffold, scaffolding, platform, elevated, roof, aerial lift, manlift, mezzanine, stairs, stairway, handrail, railing, harness, lanyard, fall protection, guardrail, hole, opening]
+    actions:
+      - Verify fall protection, ladder, scaffold, platform, or guardrail controls before work continues.
+      - Review work-at-height planning, rescue requirements, and employee authorization.
+      - Inspect similar elevated work areas, openings, and access points for repeat exposure.
+      - Confirm ladders and lifts are suitable and inspected.
+
+  - name: slip trip fall / walking surface
+    consequence: slip, trip, fall, strain, fracture, or head injury
+    severity_hint: medium
+    keywords: [slip, trip, fall, fell, floor, walkway, walking surface, stairs, step, uneven, hole, ice, snow, water, wet, oil, mud, debris, obstruction, clutter, housekeeping, pallet, cord across, mat]
+    actions:
+      - Correct the walking-surface or housekeeping condition.
+      - Review inspection frequency for the affected walkway, stairs, or access route.
+      - Verify similar walkways, stairs, and access points are free of trip or slip hazards.
+      - Consider marking, barricading, drainage, or surface repair if recurrence is likely.
+
+  - name: hand injury / pinch point / sharp edge
+    consequence: cut, crush, pinch-point injury, fracture, or amputation potential
+    severity_hint: medium
+    keywords: [hand, finger, thumb, pinch, pinch point, caught, caught between, crush, crushed, laceration, cut, sharp, knife, blade, saw, shear, die, press, nip point, glove, sliced, puncture]
+    actions:
+      - Review hand placement, tooling, guarding, and pinch-point controls.
+      - Confirm task method and PPE are adequate for the exposure.
+      - Consider fixtures, push tools, barriers, or mechanical assistance to keep hands out of line of fire.
+      - Share the learning with employees performing similar tasks.
+
+  - name: machine guarding / moving parts
+    consequence: caught-in, pinch-point, crush, entanglement, or amputation injury
+    severity_hint: high
+    keywords: [machine, machinery, guard, guarding, unguarded, interlock, conveyor, roller, belt, chain, sprocket, rotating, moving part, chuck, lathe, mill, press, shear, point of operation, jam, blockage]
+    actions:
+      - Verify guarding, interlocks, and safe access controls before work continues.
+      - Review machine-specific procedures and energy isolation needs.
+      - Inspect similar equipment for guarding, interlock, or moving-part exposure.
+      - Confirm employees do not clear jams or make adjustments while exposed to moving parts.
+
+  - name: hot work / burn / fire exposure
+    consequence: thermal burn, flash burn, fire, explosion, or eye exposure
+    severity_hint: medium
+    keywords: [weld, welding, torch, cutting, grinding, grinder, spark, hot work, hot surface, burn, burned, fire, flame, smoke, flash, combustible, flammable, fire watch, extinguisher]
+    actions:
+      - Verify hot-work controls, cooling time, fire watch, and fire-prevention measures.
+      - Review PPE requirements for burn, face, and eye exposure.
+      - Check work area for combustible materials, uncontrolled hot surfaces, or sparks.
+      - Confirm hot-work permit requirements where applicable.
+
+  - name: chemical exposure / spill / respiratory hazard
+    consequence: chemical burn, inhalation exposure, respiratory irritation, skin/eye injury, or environmental release
+    severity_hint: medium
+    keywords: [chemical, solvent, acid, caustic, alkaline, coolant, oil, fuel, diesel, hydraulic fluid, paint, thinner, resin, spill, leak, fumes, vapor, gas, dust, silica, smoke, odor, exposure, sds, label, respiratory, respirator, ventilation, eye wash, eyewash]
+    actions:
+      - Contain and clean the chemical condition using approved procedures.
+      - Review SDS, PPE, ventilation, labeling, and spill-response controls.
+      - Verify storage, transfer, and secondary containment practices for similar materials.
+      - Confirm exposed employees receive appropriate first aid or medical review if needed.
+
+  - name: ergonomics / material handling strain
+    consequence: musculoskeletal strain, sprain, overexertion, or cumulative trauma
+    severity_hint: medium
+    keywords: [lift, lifting, carry, carrying, push, pull, pushing, pulling, twist, reach, awkward, ergonomic, ergonomics, manual handling, heavy, strain, sprain, back, shoulder, knee, repetitive, posture]
+    actions:
+      - Review manual-handling method, load weight, reach distance, and ergonomic controls.
+      - Consider mechanical assistance, team lift, lift table, hoist, or task redesign.
+      - Confirm employees are trained on the safer method.
+      - Review whether repeat tasks require an ergonomic assessment.
+
+  - name: dropped object / falling object / struck-by
+    consequence: struck-by injury from dropped, flying, or falling object
+    severity_hint: high
+    keywords: [dropped, falling object, fell from, struck by, hit by, flying, projectile, object, overhead, tool dropped, material fell, parts fell, pallet fell, load shifted, stored overhead]
+    actions:
+      - Review overhead work, tool tethering, storage, exclusion zones, and barricading.
+      - Inspect rigging, lifting, racking, or storage controls related to the dropped-object exposure.
+      - Communicate the hazard to people working below or nearby.
+      - Verify materials are secured against falling, rolling, or shifting.
+
+  - name: confined space / atmosphere / engulfment
+    consequence: oxygen deficiency, toxic atmosphere, engulfment, entrapment, or fatality potential
+    severity_hint: high
+    keywords: [confined space, permit space, tank, vessel, pit, trench, manhole, atmosphere, oxygen, h2s, carbon monoxide, engulfment, rescue, attendant, entrant, ventilation, gas monitor]
+    actions:
+      - Stop work until confined-space classification and permit requirements are confirmed.
+      - Verify atmospheric testing, ventilation, attendant, rescue, and isolation controls.
+      - Confirm authorized entrants and supervisors are trained.
+      - Review whether adjacent spaces or similar tasks share the same exposure.
+
+  - name: excavation / trenching / ground disturbance
+    consequence: cave-in, struck utility, engulfment, or serious injury
+    severity_hint: high
+    keywords: [excavation, trench, trenching, dig, digging, ground disturbance, cave in, cave-in, shoring, slope, benching, utility, underground, locate, soil, excavation wall]
+    actions:
+      - Stop work until excavation protection and utility-locate controls are verified.
+      - Confirm sloping, shoring, shielding, access/egress, and inspection requirements.
+      - Keep spoil piles, equipment, and traffic away from trench edges.
+      - Review similar active excavations for the same exposure.
+
+  - name: pressure / stored energy / hydraulic pneumatic release
+    consequence: injection injury, struck-by, burn, or uncontrolled energy release
+    severity_hint: high
+    keywords: [pressure, pressurized, hydraulic, pneumatic, hose, cylinder, compressed air, air line, steam, valve, rupture, burst, stored energy, accumulator, injection, release, leak under pressure]
+    actions:
+      - Depressurize, isolate, and verify zero energy before inspection or repair.
+      - Inspect hoses, fittings, valves, cylinders, and guards for similar failure conditions.
+      - Review stored-energy procedures and employee positioning during troubleshooting.
+      - Replace damaged components with rated parts.
+
+  - name: tool / equipment condition / maintenance defect
+    consequence: injury from defective tools, equipment failure, or uncontrolled operation
+    severity_hint: medium
+    keywords: [tool, damaged tool, broken, defective, defect, cracked, missing, worn, loose, failed, failure, repair, maintenance, inspection sticker, wrench, torque wrench, drill, grinder, blade, equipment condition]
+    actions:
+      - Remove defective tools or equipment from service until repaired or replaced.
+      - Verify pre-use inspection and preventive maintenance controls.
+      - Check similar tools or equipment for the same defect.
+      - Communicate the defect criteria to employees performing similar work.
+
+  - name: PPE / personal protective equipment concern
+    consequence: preventable exposure to eye, face, hand, foot, hearing, respiratory, or head injury
+    severity_hint: medium
+    keywords: [ppe, personal protective equipment, glasses, goggles, face shield, glove, gloves, hard hat, helmet, steel toe, safety shoes, ear plugs, hearing protection, respirator, vest, sleeves]
+    actions:
+      - Verify the PPE requirement for the task and exposure.
+      - Correct PPE availability, condition, fit, and employee use.
+      - Review whether engineering or administrative controls can reduce reliance on PPE.
+      - Reinforce PPE expectations with affected employees and supervisors.
+
+  - name: environmental / weather / outdoor exposure
+    consequence: slip, vehicle incident, heat/cold stress, visibility issue, or environmental release
+    severity_hint: medium
+    keywords: [weather, rain, snow, ice, heat, cold, heat stress, lightning, wind, visibility, outdoor, yard, parking, mud, stormwater, environmental, spill outside]
+    actions:
+      - Review weather-related controls, inspection frequency, and communication.
+      - Correct outdoor walking, driving, or drainage conditions.
+      - Verify heat/cold stress controls when relevant.
+      - Check similar outdoor areas for repeat exposure.
+
+control_families:
+  - name: procedure / work planning gap
+    keywords: [procedure, sop, work instruction, plan, planning, permit, jsa, job safety analysis, risk assessment, pre task, pre-task, method statement, permit to work, change management]
+  - name: inspection / maintenance gap
+    keywords: [inspection, inspect, maintenance, pm, damaged, defect, defective, repair, broken, worn, loose, missing, checklist, pre use, pre-use]
+  - name: training / competency / communication gap
+    keywords: [training, trained, competency, qualified, communication, communicate, briefing, toolbox, supervisor, instruction, awareness, language, sign, signage]
+  - name: housekeeping / access control gap
+    keywords: [housekeeping, blocked, obstruction, clutter, access, egress, barricade, barrier, cones, tape, blocked access, walkway, storage]
+  - name: traffic separation / line-of-fire gap
+    keywords: [pedestrian, traffic, forklift, vehicle, line of fire, backing, reversing, walkway, exclusion zone, spotter, blind spot]
+  - name: energy isolation / LOTO gap
+    keywords: [loto, lockout, tagout, isolation, zero energy, energized, deenergize, electrical, hydraulic, pneumatic, stored energy]
+  - name: guarding / engineering control gap
+    keywords: [guard, guarding, barrier, interlock, enclosure, ventilation, local exhaust, machine guard, physical control]
+  - name: PPE selection / use gap
+    keywords: [ppe, glove, gloves, glasses, goggles, face shield, hard hat, respirator, hearing protection, safety shoes]
+  - name: emergency response / first aid readiness gap
+    keywords: [first aid, eyewash, eye wash, shower, extinguisher, emergency, rescue, alarm, spill kit, aed]

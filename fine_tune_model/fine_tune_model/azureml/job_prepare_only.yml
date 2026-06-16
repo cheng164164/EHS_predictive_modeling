@@ -1,0 +1,10 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+display_name: safety_prepare_instruction_data
+experiment_name: safety_fine_tune_demo
+code: ..
+command: python src/01_prepare_data.py --config configs/config.yaml
+environment:
+  conda_file: conda.yml
+  image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04
+compute: azureml:Tan-dev-cluster
