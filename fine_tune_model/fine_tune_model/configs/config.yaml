@@ -111,7 +111,7 @@ evaluation:
 
 azureml:
   subscription_id: 7f07baf7-8bba-4b88-b300-74ba5b15f52d
-  resource_group: ehs-safety
+  resource_group: EHS-Safety
   workspace_name: ehs-safety-aml
   compute: tan-dev-gpu
   experiment_name: safety_fine_tune_qwen

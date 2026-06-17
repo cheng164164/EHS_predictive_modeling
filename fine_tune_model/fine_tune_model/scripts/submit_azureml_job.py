@@ -25,6 +25,7 @@ import sys
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 from utils import load_config  # noqa: E402
+from output_sync import download_job_outputs  # noqa: E402
 
 
 def _get_required(d: Dict[str, Any], key: str) -> str:
@@ -35,6 +36,12 @@ def _get_required(d: Dict[str, Any], key: str) -> str:
 
 
 def stage_command(stage: str) -> str:
+    """Build the command run inside Azure ML.
+
+    The scripts write to project-relative outputs/ folders. The final find/ls
+    block is just diagnostic; Azure ML captures the outputs/ folder and the
+    local submit script downloads it after the run completes.
+    """
     commands = {
         "prepare": "python src/01_prepare_data.py --config configs/config.yaml && python src/02_light_llm_label.py --config configs/config.yaml",
         "train": "python src/03_train_qlora.py --config configs/config.yaml && python src/04_evaluate.py --config configs/config.yaml",
@@ -46,7 +53,8 @@ def stage_command(stage: str) -> str:
     }
     if stage not in commands:
         raise ValueError(f"Unknown stage {stage}. Use one of: {', '.join(commands)}")
-    return commands[stage]
+    diagnostic = "echo 'Output files created:' && find outputs -maxdepth 3 -type f | sort || true"
+    return commands[stage] + " && " + diagnostic
 
 
 def build_job(cfg: Dict[str, Any], stage: str):
@@ -84,6 +92,7 @@ def main() -> None:
     ap.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
     ap.add_argument("--stage", default="prepare", choices=["prepare", "train", "all", "01", "02", "03", "04"])
     ap.add_argument("--no-stream", action="store_true", help="Submit the job but do not stream logs.")
+    ap.add_argument("--no-download", action="store_true", help="Do not download outputs after the streamed job finishes.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -109,12 +118,29 @@ def main() -> None:
     print(f"  studio_url: {returned.studio_url}")
     print()
 
+    streamed_to_completion = False
     if not args.no_stream:
         print("Streaming job logs. Ctrl+C stops local streaming but does not cancel the Azure ML job.")
         try:
             ml_client.jobs.stream(returned.name)
+            streamed_to_completion = True
         except KeyboardInterrupt:
             print("\nStopped local log streaming. The Azure ML job will continue running.")
+
+    if streamed_to_completion and not args.no_download:
+        print("\nJob stream finished. Downloading Azure ML outputs back to the local VS Code project...")
+        download_job_outputs(
+            job_name=returned.name,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+            workspace_name=workspace_name,
+            download_root=PROJECT_ROOT / "outputs" / "azureml_downloads",
+            local_output_root=PROJECT_ROOT / "outputs",
+            overwrite_download=True,
+        )
+    elif args.no_stream and not args.no_download:
+        print("\nOutputs were not downloaded because --no-stream was used. After the job completes, run:")
+        print(f"  python scripts/download_azureml_job_outputs.py --job-name {returned.name}")
 
 
 if __name__ == "__main__":

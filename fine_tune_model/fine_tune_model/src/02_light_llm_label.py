@@ -105,11 +105,16 @@ def resolve_model_name(cfg_section: Dict[str, Any], use_cuda: bool) -> str:
 
 def load_generation_model(model_name: str, use_cuda: bool, trust_remote_code: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
     cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     is_encoder_decoder = bool(getattr(cfg, "is_encoder_decoder", False))
+
+    # Qwen/Llama/Mistral are decoder-only models. For batched generation,
+    # left padding avoids the repeated warning about right-padding and gives
+    # more reliable generation.
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if not is_encoder_decoder:
+        tokenizer.padding_side = "left"
 
     if is_encoder_decoder:
         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -124,8 +129,6 @@ def load_generation_model(model_name: str, use_cuda: bool, trust_remote_code: bo
             torch_dtype=torch.float16 if use_cuda else torch.float32,
             device_map="auto" if use_cuda else None,
         )
-        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
 
     torch_device = torch.device("cuda:0" if use_cuda else "cpu")
     if not use_cuda or is_encoder_decoder:
