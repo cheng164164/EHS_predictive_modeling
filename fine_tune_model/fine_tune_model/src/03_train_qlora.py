@@ -72,6 +72,22 @@ def infer_lora_targets(model) -> List[str]:
 
 
 def build_training_args(model_dir: Path, train_cfg: Dict[str, Any], use_cuda: bool) -> TrainingArguments:
+    requested_bf16 = bool(train_cfg.get("bf16", False))
+    requested_fp16 = bool(train_cfg.get("fp16", True))
+
+    bf16_supported = False
+    if use_cuda:
+        try:
+            bf16_supported = bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            bf16_supported = False
+
+    # Only enable bf16 if explicitly requested and supported.
+    bf16 = bool(use_cuda and requested_bf16 and bf16_supported)
+
+    # Enable fp16 on CUDA unless bf16 is being used.
+    fp16 = bool(use_cuda and requested_fp16 and not bf16)
+
     common = dict(
         output_dir=str(model_dir),
         num_train_epochs=float(train_cfg.get("num_train_epochs", 1)),
@@ -84,11 +100,14 @@ def build_training_args(model_dir: Path, train_cfg: Dict[str, Any], use_cuda: bo
         save_steps=int(train_cfg.get("save_steps", 100)),
         save_total_limit=2,
         report_to=[],
-        fp16=bool(use_cuda),
-        bf16=bool(use_cuda and torch.cuda.is_bf16_supported()),
+        fp16=fp16,
+        bf16=bf16,
         remove_unused_columns=False,
         gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)) and use_cuda,
     )
+
+    print(f"Mixed precision: fp16={fp16}, bf16={bf16}, bf16_supported={bf16_supported}")
+
     try:
         return TrainingArguments(eval_strategy="steps", **common)
     except TypeError:
@@ -187,14 +206,26 @@ def main() -> None:
 
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     args_tr = build_training_args(model_dir, train_cfg, use_cuda)
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=args_tr,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
         data_collator=collator,
     )
+
+    try:
+        trainer = Trainer(
+            **trainer_kwargs,
+            processing_class=tokenizer,
+        )
+    except TypeError:
+        trainer = Trainer(
+            **trainer_kwargs,
+            tokenizer=tokenizer,
+        )
+
+
     trainer.train()
 
     adapter_dir = model_dir / train_cfg.get("output_model_name", "safety-risk-qwen-lora")

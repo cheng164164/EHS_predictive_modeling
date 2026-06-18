@@ -68,12 +68,17 @@ labeling:
     batch_size_gpu: 2
     batch_size_cpu: 1
     progress_interval: 25
-    merge_into_assistant_output: false
-    merge_min_confidence: medium
+    merge_into_assistant_output: true
+    # Low-confidence labels are now kept; confidence is audit metadata only.
+    merge_min_confidence: low
+    reject_low_confidence: false
+    keep_invalid_json_with_fallback: true
     output_raw_file: safety_instruction_train_with_light_llm_raw.jsonl
     output_merged_file: safety_instruction_train_with_light_llm_merged.jsonl
     skipped_file: light_llm_skipped_records.jsonl
     rejected_file: light_llm_rejected_labels.jsonl
+    included_file: light_llm_included_labels.jsonl
+    parse_fallback_file: light_llm_parse_fallback_labels.jsonl
 
 training:
   # Default for your tan-dev-gpu cluster: Standard_NC6s_v3, 1 x NVIDIA Tesla V100, 16GB GPU memory.
@@ -96,7 +101,8 @@ training:
   use_4bit: true
   force_cpu: false
   gradient_checkpointing: true
-  train_file: safety_instruction_train.jsonl
+  # train_file: safety_instruction_train.jsonl
+  train_file: safety_instruction_train_with_light_llm_merged.jsonl
   # After you trust 02 output, switch this to safety_instruction_train_with_light_llm_merged.jsonl
   val_file: safety_instruction_val.jsonl
   lora:

@@ -4,7 +4,9 @@ Key behavior:
 - Uses a GPU model by default when CUDA is available, with CPU fallback.
 - Scans the training JSONL and only labels records with meaningful text.
 - Skips low-information records instead of forcing hallucinated labels.
-- Writes raw/merged outputs plus skipped/rejected-label audit files.
+- Keeps all selected safety-related records, including low-confidence and JSON-fallback labels.
+- Only rejects records before labeling when text is too short or not meaningful.
+- Writes raw/merged outputs plus included/skipped/rejected-label audit files.
 """
 
 from __future__ import annotations
@@ -190,18 +192,73 @@ def generate_batch(tokenizer, model, prompts: List[str], max_new_tokens: int, ba
     return outputs
 
 
+def extract_balanced_json(text: str) -> str:
+    """Return the first balanced JSON-like object found in text, or an empty string."""
+    text = (text or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return ""
+
+
+def repair_json_text(text: str) -> str:
+    """Repair only common LLM formatting issues; do not invent field values."""
+    text = (text or "").strip()
+    candidate = extract_balanced_json(text) or text
+    candidate = candidate.strip()
+    if not candidate.startswith("{") and ('"risk_pattern"' in candidate or '"hazard_tags"' in candidate):
+        candidate = "{" + candidate
+    if candidate.startswith("{") and not candidate.endswith("}"):
+        candidate = candidate + "}"
+    candidate = candidate.replace(";\n", ",\n")
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    # Normalize common accidental key casing.
+    replacements = {
+        '"Recommended_actions"': '"recommended_actions"',
+        '"recommended action"': '"recommended_actions"',
+        '"hazard tag"': '"hazard_tags"',
+        '"hazard pattern"': '"risk_pattern"',
+        '"risk pattern"': '"risk_pattern"',
+    }
+    for a, b in replacements.items():
+        candidate = candidate.replace(a, b)
+    return candidate
+
+
 def try_parse_json(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if m:
+    if not text:
+        return {}
+    for candidate in [text, extract_balanced_json(text), repair_json_text(text)]:
+        if not candidate:
+            continue
         try:
-            return json.loads(m.group(0))
+            obj = json.loads(candidate)
+            return obj if isinstance(obj, dict) else {}
         except Exception:
-            return {}
+            continue
     return {}
 
 
@@ -245,13 +302,81 @@ def normalize_label(label: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+
+
+def dedupe_list(items: List[str], max_items: int = 6) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        item = re.sub(r"\s+", " ", str(item or "").strip())
+        key = item.lower()
+        if not item or key in seen or key in BAD_LABEL_STRINGS:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def compact_safety_description_from_text(record_text: str, raw_label: str = "") -> str:
+    """Build a useful free-text description when the model did not return valid JSON.
+
+    This keeps safety-related records instead of discarding them. It does not try
+    to claim a precise risk taxonomy; it preserves the model's useful natural
+    language if available, otherwise uses the cleaned record text.
+    """
+    raw = re.sub(r"\s+", " ", (raw_label or "").strip())
+    # Avoid keeping schema-repetition noise as the summary.
+    if raw and raw.lower().count("recommended_actions") <= 1 and len(raw) >= 30:
+        return raw[:700]
+    cleaned = re.sub(r"\s+", " ", (record_text or "").strip())
+    return cleaned[:700]
+
+
+def load_existing_assistant_output(rec: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        obj = json.loads(rec.get("messages", [])[2].get("content", "{}"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def fallback_label_from_record(rec: Dict[str, Any], raw_label: str, record_text: str) -> Dict[str, Any]:
+    """Create a schema-compatible low-confidence label when JSON parsing fails."""
+    base = load_existing_assistant_output(rec)
+    summary = compact_safety_description_from_text(record_text, raw_label)
+    hazard_tags = normalize_list(base.get("hazard_tags"))
+    control_tags = normalize_list(base.get("control_failure_tags"))
+    recommended_actions = normalize_list(base.get("recommended_actions"))
+    evidence = normalize_list(base.get("evidence_phrases"))
+    if not evidence:
+        # Use a short exact-ish phrase from the record as weak evidence.
+        cleaned = re.sub(r"\s+", " ", (record_text or "").strip())
+        evidence = [cleaned[:180]] if cleaned else []
+    label = {
+        "risk_pattern": str(base.get("risk_pattern") or "unknown"),
+        "hazard_tags": dedupe_list(hazard_tags),
+        "control_failure_tags": dedupe_list(control_tags),
+        "potential_consequence": str(base.get("potential_consequence") or "unknown"),
+        "recommended_actions": dedupe_list(recommended_actions),
+        "evidence_phrases": dedupe_list(evidence, max_items=3),
+        "limitations": "LLM output was not valid JSON, so this label keeps the existing weak taxonomy label and stores the LLM output as free-text description.",
+        "confidence": "low",
+        "llm_free_text_description": summary,
+        "parse_status": "fallback_from_invalid_json",
+    }
+    return normalize_label(label) | {"llm_free_text_description": summary, "parse_status": "fallback_from_invalid_json"}
+
 def confidence_allowed(label: Dict[str, Any], min_confidence: str) -> bool:
     min_confidence = str(min_confidence or "medium").lower()
     return CONFIDENCE_ORDER.get(label.get("confidence", "low"), 0) >= CONFIDENCE_ORDER.get(min_confidence, 1)
 
 
-def merge_label_into_output(rec: Dict[str, Any], label: Dict[str, Any], min_confidence: str = "medium") -> Dict[str, Any]:
-    if not label or not confidence_allowed(label, min_confidence):
+def merge_label_into_output(rec: Dict[str, Any], label: Dict[str, Any], min_confidence: str = "low") -> Dict[str, Any]:
+    # Keep all selected safety-related labels. Confidence is retained in metadata
+    # but no longer blocks merging. Very low-information records are skipped before labeling.
+    if not label:
         return rec
     try:
         out = json.loads(rec["messages"][2]["content"])
@@ -265,6 +390,8 @@ def merge_label_into_output(rec: Dict[str, Any], label: Dict[str, Any], min_conf
         out["evidence_phrases"] = label["evidence_phrases"]
     if label.get("limitations"):
         out["limitations"] = label["limitations"]
+    if label.get("llm_free_text_description"):
+        out["llm_free_text_description"] = label["llm_free_text_description"]
     rec["messages"][2]["content"] = json.dumps(out, ensure_ascii=False, indent=2)
     return rec
 
@@ -323,9 +450,13 @@ def main() -> None:
     max_new_tokens = int(llm_cfg.get("max_new_tokens", 384))
 
     start = time.time()
-    parsed_count = merged_count = rejected_count = 0
+    parsed_count = merged_count = 0
+    parse_fallback_count = 0
     low_count = medium_count = high_count = 0
-    rejected: List[Dict[str, Any]] = []
+    included: List[Dict[str, Any]] = []
+    parse_fallbacks: List[Dict[str, Any]] = []
+    # Rejected now means not useful enough to send to the LLM, not low-confidence output.
+    rejected: List[Dict[str, Any]] = list(skipped)
 
     for batch_start, batch_pairs in batch_iter(selected, batch_size):
         prompts = []
@@ -339,20 +470,25 @@ def main() -> None:
 
         for rec_idx, raw in zip(indices, results):
             rec = out[rec_idx]
-            parsed = normalize_label(try_parse_json(raw))
+            record_text = compact_for_prompt(extract_user_record_text(rec), max_prompt_chars)
+            parsed_raw = try_parse_json(raw)
+            parsed = normalize_label(parsed_raw)
+            parse_status = "parsed_json" if parsed else "fallback_from_invalid_json"
             if parsed:
                 parsed_count += 1
             else:
-                rejected_count += 1
-                rejected.append({
+                parse_fallback_count += 1
+                parsed = fallback_label_from_record(rec, raw, record_text)
+                parse_fallbacks.append({
                     "record_index": rec_idx,
                     "event_id": rec.get("metadata", {}).get("event_id"),
                     "source_type": rec.get("metadata", {}).get("source_type"),
-                    "reason": "could not parse valid JSON",
+                    "reason": "invalid_json_but_kept_with_fallback_label",
+                    "fallback_label": parsed,
                     "raw_label": raw,
                 })
-                parsed = {"confidence": "low"}
 
+            # Confidence is no longer a rejection condition. Keep low/medium/high as audit metadata only.
             conf = parsed.get("confidence", "low")
             if conf == "high":
                 high_count += 1
@@ -360,24 +496,25 @@ def main() -> None:
                 medium_count += 1
             else:
                 low_count += 1
-                if raw and raw.strip():
-                    rejected.append({
-                        "record_index": rec_idx,
-                        "event_id": rec.get("metadata", {}).get("event_id"),
-                        "source_type": rec.get("metadata", {}).get("source_type"),
-                        "reason": "low confidence or insufficient evidence",
-                        "parsed_label": parsed,
-                        "raw_label": raw,
-                    })
 
             rec.setdefault("metadata", {})["light_llm_raw_label"] = raw
             rec["metadata"]["light_llm_parsed_label"] = parsed
+            rec["metadata"]["light_llm_parse_status"] = parse_status
             rec["metadata"]["label_source"] = rec["metadata"].get("label_source", "") + "+light_llm"
-            if merge_enabled and confidence_allowed(parsed, min_confidence):
+            if merge_enabled:
                 rec = merge_label_into_output(rec, parsed, min_confidence=min_confidence)
                 rec["metadata"]["label_source"] += "_merged"
                 merged_count += 1
             out[rec_idx] = rec
+            included.append({
+                "record_index": rec_idx,
+                "event_id": rec.get("metadata", {}).get("event_id"),
+                "source_type": rec.get("metadata", {}).get("source_type"),
+                "parse_status": parse_status,
+                "confidence": parsed.get("confidence", "low"),
+                "parsed_label": parsed,
+                "raw_label": raw,
+            })
 
         completed = min(batch_start + len(batch_pairs), len(selected))
         if completed % progress_interval == 0 or completed == len(selected):
@@ -387,7 +524,7 @@ def main() -> None:
             eta_min = (remaining / rate / 60.0) if rate > 0 else 0.0
             print(
                 f"Progress: {completed}/{len(selected)} labeled ({completed / max(1, len(selected)):.1%}); "
-                f"parsed={parsed_count}; rejected={rejected_count}; "
+                f"parsed={parsed_count}; parse_fallback={parse_fallback_count}; rejected_prelabel={len(rejected)}; "
                 f"confidence low/medium/high={low_count}/{medium_count}/{high_count}; "
                 f"merged={merged_count}; elapsed={elapsed/60.0:.1f} min; ETA={eta_min:.1f} min",
                 flush=True,
@@ -400,8 +537,12 @@ def main() -> None:
 
     skipped_path = prepared / llm_cfg.get("skipped_file", "light_llm_skipped_records.jsonl")
     rejected_path = prepared / llm_cfg.get("rejected_file", "light_llm_rejected_labels.jsonl")
+    included_path = prepared / llm_cfg.get("included_file", "light_llm_included_labels.jsonl")
+    fallback_path = prepared / llm_cfg.get("parse_fallback_file", "light_llm_parse_fallback_labels.jsonl")
     write_jsonl(skipped, skipped_path)
     write_jsonl(rejected, rejected_path)
+    write_jsonl(included, included_path)
+    write_jsonl(parse_fallbacks, fallback_path)
 
     elapsed = time.time() - start
     summary = {
@@ -416,7 +557,12 @@ def main() -> None:
         "meaningful_records_selected": len(selected),
         "skipped_before_labeling": len(skipped),
         "parsed_count": parsed_count,
-        "rejected_count": rejected_count,
+        "parse_fallback_count": parse_fallback_count,
+        "included_count": len(included),
+        "rejected_count": len(rejected),
+        "rejection_policy": "Only records skipped before labeling for too-short/non-meaningful text are rejected. Low confidence and invalid JSON outputs are kept with audit metadata/fallback labels.",
+        "included_file": str(included_path),
+        "parse_fallback_file": str(fallback_path),
         "confidence_counts": {"low": low_count, "medium": medium_count, "high": high_count},
         "merge_into_assistant_output": merge_enabled,
         "merged_count": merged_count,
@@ -430,6 +576,8 @@ def main() -> None:
     print(f"Wrote {summary_path}", flush=True)
     print(f"Wrote {skipped_path}", flush=True)
     print(f"Wrote {rejected_path}", flush=True)
+    print(f"Wrote {included_path}", flush=True)
+    print(f"Wrote {fallback_path}", flush=True)
     print("Light LLM labeling finished", flush=True)
 
 

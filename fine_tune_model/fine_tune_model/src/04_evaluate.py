@@ -54,7 +54,13 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     eval_dir = ensure_dir(cfg_path(cfg, 'paths.eval_dir'))
-    test_records = read_jsonl(Path(cfg['paths']['prepared_dir']) / 'safety_instruction_test.jsonl')[: int(cfg['evaluation'].get('max_test_samples', 50))]
+    prepared_dir = cfg_path(cfg, "paths.prepared_dir")
+    test_file = prepared_dir / "safety_instruction_test.jsonl"
+
+    print(f"Using test file: {test_file}")
+
+    test_records = read_jsonl(test_file)[: int(cfg["evaluation"].get("max_test_samples", 50))]
+
     model, tokenizer, device = load_model(cfg)
     predictions = []
     valid = 0
