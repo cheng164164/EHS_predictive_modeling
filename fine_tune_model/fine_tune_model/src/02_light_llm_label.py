@@ -146,17 +146,21 @@ def build_prompt(record_text: str, tokenizer: Any | None = None) -> str:
         "Use only facts supported by the record. If the record is unclear, use unknown/empty fields and confidence=low.\n"
         "Do not invent injuries, locations, equipment, root causes, or controls that are not mentioned.\n\n"
         "Return this exact schema:\n"
-        "{\"risk_pattern\": string, \"hazard_tags\": [strings], \"control_failure_tags\": [strings], "
+        "{\"risk_pattern\": string, \"risk_pattern_description\": string, \"additional_patterns\": [strings], "
+        "\"hazard_tags\": [strings], \"control_failure_tags\": [strings], "
         "\"potential_consequence\": string, \"recommended_actions\": [strings], "
         "\"evidence_phrases\": [exact short phrases from record], \"limitations\": string, "
         "\"confidence\": \"low|medium|high\"}\n\n"
         "Examples:\n"
         "Record: Inspection completed. No specific issue described.\n"
-        "JSON: {\"risk_pattern\": \"unknown\", \"hazard_tags\": [], \"control_failure_tags\": [], "
+        "JSON: {\"risk_pattern\": \"unknown\", \"risk_pattern_description\": \"No specific risk pattern can be inferred from the available text.\", "
+        "\"additional_patterns\": [], \"hazard_tags\": [], \"control_failure_tags\": [], "
         "\"potential_consequence\": \"unknown\", \"recommended_actions\": [], \"evidence_phrases\": [], "
         "\"limitations\": \"No specific hazard or control failure is described.\", \"confidence\": \"low\"}\n\n"
         "Record: Broken pallet was found blocking the pedestrian walkway.\n"
         "JSON: {\"risk_pattern\": \"housekeeping / walking-working surface\", "
+        "\"risk_pattern_description\": \"The record describes an obstruction in a pedestrian walkway, indicating housekeeping and walking-working-surface exposure.\", "
+        "\"additional_patterns\": [\"blocked walkway / pedestrian access obstruction\"], "
         "\"hazard_tags\": [\"broken pallet\", \"blocked walkway\"], "
         "\"control_failure_tags\": [\"housekeeping gap\", \"walkway access control gap\"], "
         "\"potential_consequence\": \"slip, trip, fall, or struck-by exposure\", "
@@ -279,6 +283,9 @@ def normalize_label(label: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     risk = str(label.get("risk_pattern", "unknown") or "unknown").strip()
     out["risk_pattern"] = "unknown" if risk.lower() in BAD_LABEL_STRINGS else risk
+    desc = str(label.get("risk_pattern_description", "") or "").strip()
+    out["risk_pattern_description"] = "" if desc.lower() in BAD_LABEL_STRINGS else desc
+    out["additional_patterns"] = dedupe_list(normalize_list(label.get("additional_patterns")), max_items=8)
     out["hazard_tags"] = normalize_list(label.get("hazard_tags"))
     out["control_failure_tags"] = normalize_list(label.get("control_failure_tags"))
     pc = str(label.get("potential_consequence", "unknown") or "unknown").strip()
@@ -356,6 +363,8 @@ def fallback_label_from_record(rec: Dict[str, Any], raw_label: str, record_text:
         evidence = [cleaned[:180]] if cleaned else []
     label = {
         "risk_pattern": str(base.get("risk_pattern") or "unknown"),
+        "risk_pattern_description": str(base.get("risk_pattern_description") or "Fallback label retained the existing weak risk pattern because the LLM output was not valid JSON."),
+        "additional_patterns": dedupe_list(normalize_list(base.get("additional_patterns")), max_items=8),
         "hazard_tags": dedupe_list(hazard_tags),
         "control_failure_tags": dedupe_list(control_tags),
         "potential_consequence": str(base.get("potential_consequence") or "unknown"),
@@ -373,16 +382,70 @@ def confidence_allowed(label: Dict[str, Any], min_confidence: str) -> bool:
     return CONFIDENCE_ORDER.get(label.get("confidence", "low"), 0) >= CONFIDENCE_ORDER.get(min_confidence, 1)
 
 
+def clean_pattern_value(value: Any) -> str:
+    value = re.sub(r"\s+", " ", str(value or "").strip())
+    return "" if value.lower() in BAD_LABEL_STRINGS else value
+
+
+def merge_pattern_lists(*values: Any, max_items: int = 10) -> List[str]:
+    patterns: List[str] = []
+    for value in values:
+        if isinstance(value, list):
+            patterns.extend(value)
+        else:
+            patterns.append(value)
+    return dedupe_list([clean_pattern_value(x) for x in patterns], max_items=max_items)
+
+
+def build_risk_pattern_description(primary: str, all_patterns: List[str], llm_description: str = "") -> str:
+    if llm_description:
+        return llm_description
+    if not all_patterns:
+        return "No specific risk pattern was identified from the available record text."
+    if len(all_patterns) == 1:
+        return f"Primary risk pattern retained from the weak label/light LLM merge: {all_patterns[0]}."
+    related = "; ".join(all_patterns[1:])
+    return (
+        f"Primary risk pattern retained for training: {primary}. "
+        f"The light LLM also detected related or more specific pattern(s): {related}. "
+        "These patterns are kept together as weak training signals rather than forcing the event into only the predefined taxonomy."
+    )
+
+
 def merge_label_into_output(rec: Dict[str, Any], label: Dict[str, Any], min_confidence: str = "low") -> Dict[str, Any]:
-    # Keep all selected safety-related labels. Confidence is retained in metadata
-    # but no longer blocks merging. Very low-information records are skipped before labeling.
+    """Merge light-LLM labels without overwriting the original weak risk pattern.
+
+    The original risk_pattern is kept as the primary pattern when it is present.
+    The LLM-detected pattern is preserved in additional_patterns when it differs,
+    so training data can learn both predefined taxonomy patterns and newly
+    discovered/free-form patterns.
+    """
     if not label:
         return rec
     try:
         out = json.loads(rec["messages"][2]["content"])
     except Exception:
         return rec
-    for k in ["risk_pattern", "hazard_tags", "control_failure_tags", "potential_consequence", "recommended_actions"]:
+
+    original_pattern = clean_pattern_value(out.get("risk_pattern"))
+    llm_pattern = clean_pattern_value(label.get("risk_pattern"))
+    existing_additional = normalize_list(out.get("additional_patterns"))
+    llm_additional = normalize_list(label.get("additional_patterns"))
+
+    all_patterns = merge_pattern_lists(original_pattern, existing_additional, llm_pattern, llm_additional, max_items=10)
+    primary_pattern = original_pattern or (all_patterns[0] if all_patterns else "unknown")
+    additional_patterns = [p for p in all_patterns if p.lower() != primary_pattern.lower()]
+
+    out["risk_pattern"] = primary_pattern
+    out["additional_patterns"] = additional_patterns
+    out["risk_pattern_description"] = build_risk_pattern_description(
+        primary=primary_pattern,
+        all_patterns=[primary_pattern] + additional_patterns if primary_pattern != "unknown" else additional_patterns,
+        llm_description=str(label.get("risk_pattern_description", "") or "").strip(),
+    )
+
+    # Let the light LLM enrich supporting fields, but do not replace the primary risk_pattern.
+    for k in ["hazard_tags", "control_failure_tags", "potential_consequence", "recommended_actions"]:
         v = label.get(k)
         if v and v != "unknown":
             out[k] = v
@@ -392,6 +455,10 @@ def merge_label_into_output(rec: Dict[str, Any], label: Dict[str, Any], min_conf
         out["limitations"] = label["limitations"]
     if label.get("llm_free_text_description"):
         out["llm_free_text_description"] = label["llm_free_text_description"]
+
+    rec.setdefault("metadata", {})["risk_pattern_original"] = original_pattern
+    rec["metadata"]["risk_pattern_light_llm"] = llm_pattern
+    rec["metadata"]["risk_pattern_all"] = all_patterns
     rec["messages"][2]["content"] = json.dumps(out, ensure_ascii=False, indent=2)
     return rec
 

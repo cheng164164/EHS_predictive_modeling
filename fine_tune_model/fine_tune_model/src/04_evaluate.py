@@ -12,7 +12,7 @@ from utils import cfg_path, ensure_dir, load_config, read_jsonl, write_jsonl
 from src_compat import format_messages_for_eval
 
 REQUIRED_KEYS = [
-    'event_summary', 'risk_pattern', 'hazard_tags', 'control_failure_tags',
+    'event_summary', 'risk_pattern', 'risk_pattern_description', 'additional_patterns', 'hazard_tags', 'control_failure_tags',
     'potential_consequence', 'risk_level', 'recommended_actions',
     'escalation_recommended', 'recommended_review_group', 'evidence_phrases', 'limitations'
 ]
@@ -54,13 +54,9 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     eval_dir = ensure_dir(cfg_path(cfg, 'paths.eval_dir'))
-    prepared_dir = cfg_path(cfg, "paths.prepared_dir")
-    test_file = prepared_dir / "safety_instruction_test.jsonl"
-
-    print(f"Using test file: {test_file}")
-
-    test_records = read_jsonl(test_file)[: int(cfg["evaluation"].get("max_test_samples", 50))]
-
+    test_file = cfg_path(cfg, 'paths.prepared_dir') / 'safety_instruction_test.jsonl'
+    print(f'Using test file: {test_file}', flush=True)
+    test_records = read_jsonl(test_file)[: int(cfg['evaluation'].get('max_test_samples', 50))]
     model, tokenizer, device = load_model(cfg)
     predictions = []
     valid = 0

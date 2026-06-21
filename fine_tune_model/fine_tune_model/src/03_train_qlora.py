@@ -95,9 +95,9 @@ def build_training_args(model_dir: Path, train_cfg: Dict[str, Any], use_cuda: bo
         per_device_eval_batch_size=int(train_cfg.get("per_device_eval_batch_size", 1)),
         gradient_accumulation_steps=int(train_cfg.get("gradient_accumulation_steps", 8)),
         learning_rate=float(train_cfg.get("learning_rate", 2e-4)),
-        logging_steps=int(train_cfg.get("logging_steps", 10)),
-        eval_steps=int(train_cfg.get("eval_steps", 100)),
-        save_steps=int(train_cfg.get("save_steps", 100)),
+        logging_steps=int(train_cfg.get("logging_steps", 50)),
+        eval_steps=int(train_cfg.get("eval_steps", 200)),
+        save_steps=int(train_cfg.get("save_steps", 200)),
         save_total_limit=2,
         report_to=[],
         fp16=fp16,
@@ -196,8 +196,17 @@ def main() -> None:
     print(f"  train_file: {train_path}", flush=True)
     print(f"  val_file:   {val_path}", flush=True)
 
-    train_records = read_jsonl(train_path)[: int(train_cfg.get("max_train_samples", 2400))]
-    val_records = read_jsonl(val_path)[: int(train_cfg.get("max_eval_samples", 300))]
+    train_records = read_jsonl(train_path)
+    val_records = read_jsonl(val_path)
+
+    max_train_samples = train_cfg.get("max_train_samples", None)
+    max_eval_samples = train_cfg.get("max_eval_samples", None)
+
+    if max_train_samples is not None:
+        train_records = train_records[: int(max_train_samples)]
+
+    if max_eval_samples is not None:
+        val_records = val_records[: int(max_eval_samples)]
     print(f"  train_records_used: {len(train_records)}", flush=True)
     print(f"  val_records_used: {len(val_records)}", flush=True)
 

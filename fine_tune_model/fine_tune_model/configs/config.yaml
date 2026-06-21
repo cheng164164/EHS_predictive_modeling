@@ -11,7 +11,7 @@ paths:
 sampling:
   max_rows_read: 1000000
   reuse_existing_sampled_records: false
-  max_examples_total: 3000
+  max_examples_total: 15000
   train_ratio: 0.8
   val_ratio: 0.1
   test_ratio: 0.1
@@ -20,11 +20,11 @@ sampling:
   prefer_english_only: false
   dedupe_on_normalized_text: true
   source_type_targets:
-    incident: 750
-    near_miss: 500
-    hazard_identification: 900
-    audit: 400
-    task: 450
+    incident: 3750
+    near_miss: 2500
+    hazard_identification: 4500
+    audit: 2000
+    task: 2250
 
 labeling:
   taxonomy:
@@ -58,8 +58,8 @@ labeling:
     auto_fallback_to_cpu_model: true
     trust_remote_code: false
     # Number of meaningful records to label. The script scans the train file and skips weak records.
-    max_records: 800
-    max_candidate_scan: 5000
+    max_records: 3000
+    max_candidate_scan: 6000
     min_meaningful_text_chars: 140
     min_alpha_words: 12
     skip_low_information_sources: false
@@ -82,13 +82,13 @@ labeling:
 
 training:
   # Default for your tan-dev-gpu cluster: Standard_NC6s_v3, 1 x NVIDIA Tesla V100, 16GB GPU memory.
-  base_model: Qwen/Qwen2.5-1.5B-Instruct
+  base_model: Qwen/Qwen2.5-3B-Instruct
   cpu_fallback_model: Qwen/Qwen2.5-0.5B-Instruct
   auto_fallback_to_cpu_model: true
   trust_remote_code: false
   output_model_name: safety-risk-qwen-lora
   max_seq_length: 1536
-  num_train_epochs: 1
+  num_train_epochs: 2
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 8
@@ -96,7 +96,7 @@ training:
   logging_steps: 10
   eval_steps: 100
   save_steps: 100
-  max_train_samples: 2400
+  max_train_samples: null
   max_eval_samples: 300
   use_4bit: true
   force_cpu: false
@@ -112,8 +112,88 @@ training:
 
 evaluation:
   max_test_samples: 150
-  max_new_tokens: 350
+  max_new_tokens: 1000
   temperature: 0.1
+
+
+inference:
+  # mode options: auto | manual | single | queries_file
+  # auto: sample cases from prepared data first, original CSV second, synthetic fallback last
+  # manual: use the manual_cases list below
+  # single: use the single_case block below
+  # queries_file: read cases from a .txt, .csv, .json, or .jsonl file
+  mode: auto
+  auto_cases: 10
+  sample_source: auto   # auto | prepared | original_csv | synthetic
+
+  # Optional external file if mode: queries_file
+  queries_file: null
+
+  # Optional one-case input if mode: single
+  single_case:
+    case_id: manual_001
+    source_type: near_miss
+    site: unknown
+    department: unknown
+    description: ""
+
+  # Optional manual cases if mode: manual
+  manual_cases:
+    - case_id: demo_001
+      source_type: near_miss
+      site: Demo Site
+      department: Warehouse
+      description: "A forklift reversed near a pedestrian walkway without a spotter. No contact occurred, but the pedestrian route was not separated from mobile equipment."
+    - case_id: demo_002
+      source_type: hazard_identification
+      site: Demo Site
+      department: Maintenance
+      description: "An extension cord was found across a wet work area near a welder. The plug was loose and employees were still using the equipment."
+
+  # First LLM call: test the fine-tuned model.
+  # This intentionally does NOT define a hard-coded output schema.
+  # The goal is to see whether the trained model naturally returns the learned structured output.
+  model_system_prompt: "You are a safety risk analysis assistant."
+  model_prompt_template: |
+    Analyze the following safety event.
+
+    source_type: {source_type}
+    site: {site}
+    department: {department}
+    description: {description}
+
+  # Second LLM call: summarize the model output for stakeholders.
+  # This uses the first model output as evidence and should not invent unsupported facts.
+  generate_stakeholder_summary: true
+  summary_system_prompt: "You summarize safety analysis results for business stakeholders."
+  summary_prompt_template: |
+    Create a concise stakeholder-friendly summary from the model output below.
+
+    Original safety event:
+    {description}
+
+    Model structured output:
+    {structured_output}
+
+    Write the summary in plain business language. Focus on what risk the case shows, why it matters, and what prevention actions are suggested. Do not add facts that are not supported by the safety event or model output.
+
+  # Generation settings
+  max_new_tokens: 1000
+  temperature: 0.1
+  summary_max_new_tokens: 350
+  summary_temperature: 0.1
+  max_input_tokens: 1536
+  seed: 42
+
+  # Output settings. If output_dir is null, outputs go under paths.eval_dir.
+  output_dir: null
+  run_name: null
+  write_jsonl: true
+  write_csv: true
+  write_summary_json: true
+  write_markdown_report: true
+
+
 
 azureml:
   subscription_id: 7f07baf7-8bba-4b88-b300-74ba5b15f52d
@@ -125,3 +205,5 @@ azureml:
     image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04
     conda_file: azureml/conda.yml
   job_name_prefix: safety-ft-qwen
+
+

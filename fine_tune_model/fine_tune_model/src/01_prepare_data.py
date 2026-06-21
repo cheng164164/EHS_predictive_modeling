@@ -29,7 +29,7 @@ SYSTEM_PROMPT = (
 )
 
 BASE_SCHEMA_KEYS = [
-    'event_summary', 'risk_pattern', 'discovered_theme', 'hazard_tags', 'control_failure_tags',
+    'event_summary', 'risk_pattern', 'risk_pattern_description', 'additional_patterns', 'discovered_theme', 'hazard_tags', 'control_failure_tags',
     'potential_consequence', 'risk_level', 'recommended_actions', 'escalation_recommended',
     'recommended_review_group', 'evidence_phrases', 'limitations'
 ]
@@ -282,6 +282,11 @@ def make_output(row: pd.Series, taxonomy: Dict[str, Any], cfg: Dict[str, Any], d
     return {
         'event_summary': summarize_event(row, text),
         'risk_pattern': pattern,
+        'risk_pattern_description': (
+            f"Primary weak pattern inferred from configured taxonomy/source-type logic: {pattern}. "
+            "Light LLM labeling may add related or newly detected patterns in additional_patterns."
+        ),
+        'additional_patterns': [],
         'discovered_theme': discovered_theme or 'not clustered',
         'hazard_tags': tags[:8],
         'control_failure_tags': controls,

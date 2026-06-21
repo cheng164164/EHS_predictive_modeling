@@ -25,7 +25,7 @@ import sys
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 from utils import load_config  # noqa: E402
-from output_sync import download_job_outputs  # noqa: E402
+from download_azureml_job_outputs import download_job_outputs  # noqa: E402
 
 
 def _get_required(d: Dict[str, Any], key: str) -> str:
@@ -134,8 +134,9 @@ def main() -> None:
             subscription_id=subscription_id,
             resource_group=resource_group,
             workspace_name=workspace_name,
-            download_root=PROJECT_ROOT / "outputs" / "azureml_downloads",
             local_output_root=PROJECT_ROOT / "outputs",
+            full_download_root=PROJECT_ROOT / "outputs" / "azureml_downloads",
+            keep_full_download=False,
             overwrite_download=True,
         )
     elif args.no_stream and not args.no_download:
