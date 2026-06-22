@@ -311,6 +311,13 @@ def create_chat_record(row: pd.Series, output: Dict[str, Any], label_source: str
             'event_id': safe_str(row.get('event_id')),
             'source_type': safe_str(row.get('source_type')),
             'source_subtype': safe_str(row.get('source_subtype')),
+            # Include these fields so downstream inference/demo sampling can report
+            # site and department without having to re-parse the prompt text.
+            'site': safe_str(row.get('site')),
+            'department': safe_str(row.get('department')),
+            'event_date': safe_str(row.get('event_date')),
+            'category': safe_str(row.get('category')),
+            'status': safe_str(row.get('status')),
             'label_source': label_source,
             'risk_pattern': output.get('risk_pattern'),
             'discovered_theme': output.get('discovered_theme'),

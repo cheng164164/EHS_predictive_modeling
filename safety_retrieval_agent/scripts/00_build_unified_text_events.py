@@ -66,9 +66,19 @@ def truthy_series(series: pd.Series) -> pd.Series:
 
 
 def parse_datetime_series(series: pd.Series | object) -> pd.Series:
-    if isinstance(series, pd.Series):
-        return pd.to_datetime(series, errors="coerce", utc=False, format="mixed")
-    return pd.to_datetime(pd.Series(series), errors="coerce", utc=False, format="mixed")
+    """Parse datetimes consistently as timezone-naive timestamps.
+
+    Some Velocity/Accelerate exports mix timezone-aware strings with
+    timezone-naive strings. Parsing with utc=True first standardizes all
+    values, then tz_convert(None) removes the timezone so comparisons like
+    due_date < today do not fail with tz-aware/tz-naive errors.
+    """
+    values = series if isinstance(series, pd.Series) else pd.Series(series)
+    parsed = pd.to_datetime(values, errors="coerce", utc=True, format="mixed")
+    try:
+        return parsed.dt.tz_convert(None)
+    except Exception:
+        return parsed
 
 
 def coalesce_datetime(df: pd.DataFrame, columns: Iterable[str]) -> pd.Series:
@@ -169,14 +179,61 @@ def normalize_source_type(value: object) -> str:
     return text or "incident"
 
 
+def normalize_id_value(value: object) -> str:
+    """Normalize exported numeric IDs so 1660, 1660.0, and '1660.0' match."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "null", "<na>"}:
+        return ""
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except Exception:
+        pass
+    return text
+
+
+def is_id_like(value: object) -> bool:
+    """Return True when a supposed location name is really just a raw ID."""
+    text = clean_text_value(value)
+    if not text:
+        return True
+    try:
+        number = float(text)
+        return number.is_integer()
+    except Exception:
+        return False
+
+
+def clean_location_name(value: object) -> str:
+    """Clean a location label and suppress raw ID fallbacks from display fields."""
+    text = clean_text_value(value)
+    return "" if is_id_like(text) else text
+
+
 def build_location_hierarchy(path: Path, lookup: dict[str, str]) -> pd.DataFrame:
-    """Create a lightweight location dimension with site/department/path fields."""
+    """Create a decoded location dimension with hierarchy, site, and department fields.
+
+    Rules for the unified output:
+    - location_path_clean contains decoded location names only, separated by " > ".
+    - department is the third level of the decoded hierarchy.
+    - site is the last two decoded levels, joined with " > ".
+    - raw IDs are used only for joining; they are not displayed in site, department, or path.
+    """
+    base_cols = [
+        "LOCATIONID", "location_name", "location_path", "location_path_clean", "site", "department",
+        "location_level_1", "location_level_2", "location_level_3", "location_level_4", "location_level_5", "location_level_6",
+    ]
     if not path.exists():
-        return pd.DataFrame(columns=["LOCATIONID", "location_name", "location_path_clean", "site", "department"])
+        return pd.DataFrame(columns=base_cols)
+
     loc = read_csv(path)
     id_col = _first_existing(loc.columns, ["LOCATIONID", "LOCATION_ID", "ID"])
     if id_col is None:
-        return pd.DataFrame(columns=["LOCATIONID", "location_name", "location_path_clean", "site", "department"])
+        return pd.DataFrame(columns=base_cols)
+
     name_col = _first_existing(
         loc.columns,
         ["LOCATIONNAME", "LOCATION", "NAME", "SHORTNAME", "DISPLAYNAME", "DESCRIPTION", "LOCATIONDESCRIPTION"],
@@ -184,62 +241,83 @@ def build_location_hierarchy(path: Path, lookup: dict[str, str]) -> pd.DataFrame
     parent_col = _first_existing(loc.columns, ["PARENTLOCATIONID", "PARENT_LOCATION_ID", "PARENTID", "PARENT_LOCATIONID"])
 
     loc = loc.copy()
-    loc["LOCATIONID"] = loc[id_col]
+    loc["LOCATIONID"] = loc[id_col].map(normalize_id_value)
+
     if name_col is not None:
-        loc["location_name"] = loc[name_col].fillna("").astype(str).map(clean_text_value)
+        loc["location_name"] = loc[name_col].fillna("").astype(str).map(clean_location_name)
     else:
-        loc["location_name"] = loc["LOCATIONID"].fillna("").astype(str)
+        # Do not expose LOCATIONID as a display name. Keep blank if no decoded name column exists.
+        loc["location_name"] = ""
+
+    loc = loc[loc["LOCATIONID"].astype(str).str.strip().ne("")].copy()
 
     if parent_col is not None:
-        parent_map = dict(zip(loc["LOCATIONID"].astype(str), loc[parent_col].fillna("").astype(str)))
+        parent_map = dict(zip(loc["LOCATIONID"], loc[parent_col].map(normalize_id_value)))
     else:
         parent_map = {}
-    name_map = dict(zip(loc["LOCATIONID"].astype(str), loc["location_name"].astype(str)))
+    name_map = dict(zip(loc["LOCATIONID"], loc["location_name"].astype(str)))
 
     def path_for(location_id: object) -> list[str]:
-        cur = "" if pd.isna(location_id) else str(location_id)
+        cur = normalize_id_value(location_id)
         parts: list[str] = []
         seen: set[str] = set()
         while cur and cur not in seen:
             seen.add(cur)
-            name = clean_text_value(name_map.get(cur, cur))
+            name = clean_location_name(name_map.get(cur, ""))
             if name:
                 parts.append(name)
-            parent = clean_text_value(parent_map.get(cur, ""))
-            if not parent or parent == cur or parent.lower() in {"nan", "none", "null"}:
+            parent = normalize_id_value(parent_map.get(cur, ""))
+            if not parent or parent == cur:
                 break
             cur = parent
         return list(reversed(parts)) if parts else []
 
     paths = [path_for(x) for x in loc["LOCATIONID"]]
-    loc["location_path_clean"] = [" / ".join(p) for p in paths]
-    loc["site"] = [p[0] if len(p) >= 1 else "" for p in paths]
-    loc["department"] = [p[1] if len(p) >= 2 else "" for p in paths]
-    for i in range(1, 7):
+    loc["location_path"] = [" > ".join(p) for p in paths]
+    loc["location_path_clean"] = loc["location_path"]
+    loc["department"] = [p[4] if len(p) >= 5 else "" for p in paths]
+    loc["site"] = [" > ".join(p[-2:]) if len(p) >= 2 else (p[0] if len(p) == 1 else "") for p in paths]
+
+    max_levels = max(6, max((len(p) for p in paths), default=0))
+    for i in range(1, max_levels + 1):
         loc[f"location_level_{i}"] = [p[i - 1] if len(p) >= i else "" for p in paths]
+
     cols = [
-        "LOCATIONID", "location_name", "location_path_clean", "site", "department",
+        "LOCATIONID", "location_name", "location_path", "location_path_clean", "site", "department",
         "location_level_1", "location_level_2", "location_level_3", "location_level_4", "location_level_5", "location_level_6",
     ]
     return loc[[c for c in cols if c in loc.columns]].drop_duplicates(subset=["LOCATIONID"])
 
 
 def attach_location(df: pd.DataFrame, location_dim: pd.DataFrame, id_col: str = "LOCATIONID") -> pd.DataFrame:
+    """Attach decoded location fields while keeping source table columns unchanged.
+
+    Joins with normalized location IDs so numeric exports like 1660 and 1660.0 match.
+    """
     out = df.copy()
     if id_col not in out.columns:
         out["LOCATIONID"] = np.nan
         id_col = "LOCATIONID"
+
+    out["_LOCATION_JOIN_ID"] = out[id_col].map(normalize_id_value)
+
     if location_dim.empty:
         out["site"] = ""
         out["department"] = ""
         out["location_path_clean"] = ""
-        return out
+        out["location_path"] = ""
+        return out.drop(columns=["_LOCATION_JOIN_ID"], errors="ignore")
+
+    loc = location_dim.copy()
+    loc["_LOCATION_JOIN_ID"] = loc["LOCATIONID"].map(normalize_id_value)
     loc_cols = [
-        "LOCATIONID", "location_name", "location_path_clean", "site", "department",
+        "_LOCATION_JOIN_ID", "location_name", "location_path", "location_path_clean", "site", "department",
         "location_level_1", "location_level_2", "location_level_3", "location_level_4", "location_level_5", "location_level_6",
     ]
-    loc_cols = [c for c in loc_cols if c in location_dim.columns]
-    return out.merge(location_dim[loc_cols], left_on=id_col, right_on="LOCATIONID", how="left", suffixes=("", "_loc"))
+    loc_cols = [c for c in loc_cols if c in loc.columns]
+
+    out = out.merge(loc[loc_cols], on="_LOCATION_JOIN_ID", how="left", suffixes=("", "_loc"))
+    return out.drop(columns=["_LOCATION_JOIN_ID"], errors="ignore")
 
 
 def build_injury_flags(injury_path: Path) -> pd.DataFrame:

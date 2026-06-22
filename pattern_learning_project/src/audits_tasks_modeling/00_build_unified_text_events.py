@@ -1,22 +1,40 @@
-#!/usr/bin/env python
+"""Step 00: build the unified safety text event table.
+
+This script combines Incident, Audit, and Task exports into one text-event table
+with the exact schema expected by downstream pattern-learning scripts.
+"""
+
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
-import config as cfg
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for path in [SCRIPT_DIR, SRC_ROOT, PROJECT_ROOT]:
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import numpy as np
 import pandas as pd
 
+try:
+    import config as cfg
+except Exception:  # pragma: no cover - lets the script import in isolated tests.
+    cfg = object()
+
 from utils import (
+    OUTPUT_COLUMNS,
     add_listitem_fields,
     build_location_hierarchy,
     clean_text_value,
     coalesce_datetime,
     coalesce_string,
     ensure_dir,
+    ensure_unified_event_schema,
     load_listitem_lookup,
     make_text_block,
     normalize_source_type,
@@ -28,6 +46,9 @@ from utils import (
 )
 
 
+def cfg_value(name: str, default):
+    return getattr(cfg, name, default)
+
 
 def log(message: str, start_time: float | None = None) -> None:
     if start_time is None:
@@ -37,33 +58,27 @@ def log(message: str, start_time: float | None = None) -> None:
 
 
 def detect_english_texts(texts: pd.Series) -> pd.DataFrame:
-    """Detect English text with a language detection library.
-
-    The filter is document-level language detection, not keyword/heuristic
-    matching. Short strings can be kept based on config because language
-    detection is unreliable for very short text.
-    """
-    library = str(getattr(cfg, "LANGUAGE_DETECTION_LIBRARY", "langdetect")).lower()
+    """Detect English text when optional English-only filtering is enabled."""
+    library = str(cfg_value("LANGUAGE_DETECTION_LIBRARY", "langdetect")).lower()
     if library != "langdetect":
         raise ValueError(
-            f"Unsupported LANGUAGE_DETECTION_LIBRARY={library!r}. "
-            "Currently supported: 'langdetect'."
+            f"Unsupported LANGUAGE_DETECTION_LIBRARY={library!r}. Currently supported: 'langdetect'."
         )
     try:
         from langdetect import DetectorFactory, LangDetectException, detect_langs
     except ImportError as exc:
         raise ImportError(
-            "ENGLISH_ONLY_TEXT_FILTER is enabled, but the 'langdetect' package is not installed. "
+            "ENGLISH_ONLY_TEXT_FILTER is enabled, but 'langdetect' is not installed. "
             "Install it with: pip install langdetect"
         ) from exc
 
-    DetectorFactory.seed = int(getattr(cfg, "LANGUAGE_DETECTION_RANDOM_STATE", 42))
-    min_prob = float(getattr(cfg, "LANGUAGE_DETECTION_MIN_PROB", 0.80))
-    min_chars = int(getattr(cfg, "LANGUAGE_DETECTION_MIN_TEXT_CHARS", 20))
-    max_chars = int(getattr(cfg, "LANGUAGE_DETECTION_MAX_TEXT_CHARS", 1000))
-    keep_short = bool(getattr(cfg, "ENGLISH_ONLY_KEEP_SHORT_TEXT", True))
-    keep_unknown = bool(getattr(cfg, "ENGLISH_ONLY_KEEP_UNKNOWN_LANGUAGE", False))
-    progress_every = int(getattr(cfg, "LANGUAGE_DETECTION_PROGRESS_EVERY", 50000))
+    DetectorFactory.seed = int(cfg_value("LANGUAGE_DETECTION_RANDOM_STATE", 42))
+    min_prob = float(cfg_value("LANGUAGE_DETECTION_MIN_PROB", 0.80))
+    min_chars = int(cfg_value("LANGUAGE_DETECTION_MIN_TEXT_CHARS", 20))
+    max_chars = int(cfg_value("LANGUAGE_DETECTION_MAX_TEXT_CHARS", 1000))
+    keep_short = bool(cfg_value("ENGLISH_ONLY_KEEP_SHORT_TEXT", True))
+    keep_unknown = bool(cfg_value("ENGLISH_ONLY_KEEP_UNKNOWN_LANGUAGE", False))
+    progress_every = int(cfg_value("LANGUAGE_DETECTION_PROGRESS_EVERY", 50000))
 
     detected_language: list[str] = []
     detected_score: list[float] = []
@@ -85,9 +100,9 @@ def detect_english_texts(texts: pd.Series) -> pd.DataFrame:
                 top = candidates[0] if candidates else None
                 lang = getattr(top, "lang", "unknown") if top is not None else "unknown"
                 prob = float(getattr(top, "prob", np.nan)) if top is not None else np.nan
+                ok = lang == "en" and prob >= min_prob
                 detected_language.append(lang)
                 detected_score.append(prob)
-                ok = lang == "en" and prob >= min_prob
                 language_status.append("english" if ok else "non_english")
                 is_english.append(ok)
             except LangDetectException:
@@ -97,8 +112,7 @@ def detect_english_texts(texts: pd.Series) -> pd.DataFrame:
                 is_english.append(bool(keep_unknown))
         if progress_every > 0 and i % progress_every == 0:
             print(
-                f"[Step 00 | {time.time() - start:,.1f}s] "
-                f"Language detection processed {i:,}/{total:,} rows...",
+                f"[Step 00 | {time.time() - start:,.1f}s] Language detection processed {i:,}/{total:,} rows...",
                 flush=True,
             )
 
@@ -112,10 +126,12 @@ def detect_english_texts(texts: pd.Series) -> pd.DataFrame:
         index=texts.index,
     )
 
+
 def attach_location(df: pd.DataFrame, location_dim: pd.DataFrame, id_col: str = "LOCATIONID") -> pd.DataFrame:
-    if id_col not in df.columns:
-        df["LOCATIONID"] = np.nan
-        id_col = "LOCATIONID"
+    """Attach hierarchy fields by location id without changing source row count."""
+    out = df.copy()
+    if id_col not in out.columns:
+        out[id_col] = np.nan
     loc_cols = [
         "LOCATIONID",
         "location_name",
@@ -131,7 +147,7 @@ def attach_location(df: pd.DataFrame, location_dim: pd.DataFrame, id_col: str = 
         "location_level_6",
     ]
     loc_cols = [c for c in loc_cols if c in location_dim.columns]
-    return df.merge(location_dim[loc_cols], left_on=id_col, right_on="LOCATIONID", how="left", suffixes=("", "_loc"))
+    return out.merge(location_dim[loc_cols], left_on=id_col, right_on="LOCATIONID", how="left", suffixes=("", "_loc"))
 
 
 def build_injury_flags(injury_path: Path) -> pd.DataFrame:
@@ -139,13 +155,15 @@ def build_injury_flags(injury_path: Path) -> pd.DataFrame:
     if "INCIDENTID" not in inj.columns:
         return pd.DataFrame(columns=["INCIDENTID", "any_injury", "severe_actual", "injury_record_count"])
     bool_cols = ["FATALITY", "LOSTTIME", "RESTRICTEDTIME", "INPATIENT", "EMERGENCYROOM"]
-    for c in bool_cols:
-        if c not in inj.columns:
-            inj[c] = False
-        inj[c] = truthy_series(inj[c])
+    for col in bool_cols:
+        if col not in inj.columns:
+            inj[col] = False
+        inj[col] = truthy_series(inj[col])
+    if "INJURYID" not in inj.columns:
+        inj["INJURYID"] = np.arange(len(inj))
     inj["any_injury"] = True
     inj["severe_actual"] = inj[["FATALITY", "LOSTTIME", "RESTRICTEDTIME", "INPATIENT"]].any(axis=1)
-    agg = inj.groupby("INCIDENTID", dropna=False).agg(
+    return inj.groupby("INCIDENTID", dropna=False).agg(
         any_injury=("any_injury", "max"),
         severe_actual=("severe_actual", "max"),
         injury_record_count=("INJURYID", "count"),
@@ -155,47 +173,28 @@ def build_injury_flags(injury_path: Path) -> pd.DataFrame:
         inpatient=("INPATIENT", "max"),
         emergencyroom=("EMERGENCYROOM", "max"),
     ).reset_index()
-    return agg
 
 
 def build_incident_events(data_dir: Path, location_dim: pd.DataFrame, listitem_lookup: dict, sample_size: int | None) -> pd.DataFrame:
-    path = data_dir / "INCIDENT_VIEW.csv"
-    df = read_csv(path, nrows=sample_size)
+    df = read_csv(data_dir / "INCIDENT_VIEW.csv", nrows=sample_size)
     df = add_listitem_fields(df, "INCIDENTCATEGORYID", "incident_category", listitem_lookup)
     df = add_listitem_fields(df, "INCIDENTSTATUSID", "incident_status", listitem_lookup)
-    injury = build_injury_flags(data_dir / "INCIDENTINJURY_VIEW.csv")
-    df = df.merge(injury, on="INCIDENTID", how="left")
-    for c in ["any_injury", "severe_actual", "fatality", "losttime", "restrictedtime", "inpatient", "emergencyroom"]:
-        if c in df.columns:
-            df[c] = df[c].fillna(False).astype(bool)
-    if "injury_record_count" in df.columns:
-        df["injury_record_count"] = df["injury_record_count"].fillna(0).astype(int)
+    df = df.merge(build_injury_flags(data_dir / "INCIDENTINJURY_VIEW.csv"), on="INCIDENTID", how="left")
+    for col in ["any_injury", "severe_actual", "fatality", "losttime", "restrictedtime", "inpatient", "emergencyroom"]:
+        df[col] = truthy_series(df[col]) if col in df.columns else False
+    df["injury_record_count"] = pd.to_numeric(df.get("injury_record_count", 0), errors="coerce").fillna(0).astype(int)
     df = attach_location(df, location_dim, "LOCATIONID")
 
     event_date = coalesce_datetime(df, ["INCIDENTDATE", "REPORTDATE", "INVESTIGATIONSTARTDATE"])
     source_subtype = df.get("incident_category_item", pd.Series("Incident", index=df.index)).map(clean_text_value)
     source_type = source_subtype.map(normalize_source_type)
     status = df.get("incident_status_item", pd.Series("", index=df.index)).map(clean_text_value)
-
     text_fields = [
-        "TITLE",
-        "DESCRIPTION",
-        "ACTIVITYDURINGINCIDENT",
-        "IMMEDIATEACTION",
-        "IMMEDIATECAUSES",
-        "CAUSALFACTORS",
-        "BESTPRACTICES",
-        "RISKACTION",
-        "RISKCONDITION",
-        "EQUIPMENT",
-        "VEHICLE",
-        "OTHERPROCESS",
-        "OTHERACTIVITY",
-        "OFFPREMISESLOCATION",
-        "OTHERLOCATION",
+        "TITLE", "DESCRIPTION", "ACTIVITYDURINGINCIDENT", "IMMEDIATEACTION", "IMMEDIATECAUSES",
+        "CAUSALFACTORS", "BESTPRACTICES", "RISKACTION", "RISKCONDITION", "EQUIPMENT", "VEHICLE",
+        "OTHERPROCESS", "OTHERACTIVITY", "OFFPREMISESLOCATION", "OTHERLOCATION",
     ]
-    clean_text = make_text_block(df, text_fields)
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "event_id": "incident_" + df["INCIDENTID"].astype(str),
         "source_type": source_type,
         "source_subtype": source_subtype,
@@ -207,7 +206,7 @@ def build_incident_events(data_dir: Path, location_dim: pd.DataFrame, listitem_l
         "location_path": df.get("location_path_clean", df.get("location_path", "")),
         "title": coalesce_string(df, ["TITLE", "INCIDENTNUMBER"]),
         "description": coalesce_string(df, ["DESCRIPTION"]),
-        "clean_text": clean_text,
+        "clean_text": make_text_block(df, text_fields),
         "status": status,
         "category": source_subtype,
         "is_open_task": False,
@@ -225,12 +224,10 @@ def build_incident_events(data_dir: Path, location_dim: pd.DataFrame, listitem_l
         "raw_status_id": df.get("INCIDENTSTATUSID"),
         "raw_category_id": df.get("INCIDENTCATEGORYID"),
     })
-    return out
 
 
 def build_audit_events(data_dir: Path, location_dim: pd.DataFrame, listitem_lookup: dict, sample_size: int | None) -> pd.DataFrame:
-    path = data_dir / "AUDIT_VIEW.csv"
-    df = read_csv(path, nrows=sample_size)
+    df = read_csv(data_dir / "AUDIT_VIEW.csv", nrows=sample_size)
     df = add_listitem_fields(df, "AUDITCATEGORYID", "audit_category", listitem_lookup)
     df = add_listitem_fields(df, "AUDITTYPEID", "audit_type", listitem_lookup)
     df = add_listitem_fields(df, "AUDITSTATUSID", "audit_status", listitem_lookup)
@@ -242,22 +239,20 @@ def build_audit_events(data_dir: Path, location_dim: pd.DataFrame, listitem_look
     category = df.get("audit_category_item", pd.Series("Audit", index=df.index)).map(clean_text_value)
     audit_type = df.get("audit_type_item", pd.Series("", index=df.index)).map(clean_text_value)
     source_subtype = np.where(audit_type.ne(""), category + " - " + audit_type, category)
-
     text_fields = ["TITLE", "DESCRIPTION", "COMMENTS", "ASSOCIATEDPARTIES", "SHORTNAME", "OTHERLOCATIONNAME"]
-    clean_text = make_text_block(df, text_fields)
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "event_id": "audit_" + df["AUDITID"].astype(str),
         "source_type": "audit",
         "source_subtype": source_subtype,
         "source_id": df["AUDITID"],
         "event_date": event_date,
-        "location_id": df.get("SCHEDULEDLOCATIONID", df.get("LOCATIONID")),
+        "location_id": df.get(loc_col),
         "site": df.get("site", ""),
         "department": df.get("department", ""),
         "location_path": df.get("location_path_clean", df.get("location_path", "")),
         "title": coalesce_string(df, ["TITLE", "SHORTNAME", "AUDITNUMBER"]),
         "description": coalesce_string(df, ["DESCRIPTION", "COMMENTS"]),
-        "clean_text": clean_text,
+        "clean_text": make_text_block(df, text_fields),
         "status": status,
         "category": category,
         "audit_type": audit_type,
@@ -277,12 +272,10 @@ def build_audit_events(data_dir: Path, location_dim: pd.DataFrame, listitem_look
         "raw_category_id": df.get("AUDITCATEGORYID"),
         "raw_type_id": df.get("AUDITTYPEID"),
     })
-    return out
 
 
 def build_task_events(data_dir: Path, location_dim: pd.DataFrame, listitem_lookup: dict, sample_size: int | None) -> pd.DataFrame:
-    path = data_dir / "TASK_VIEW.csv"
-    df = read_csv(path, nrows=sample_size)
+    df = read_csv(data_dir / "TASK_VIEW.csv", nrows=sample_size)
     df = add_listitem_fields(df, "TASKCATEGORYID", "task_category", listitem_lookup)
     df = add_listitem_fields(df, "TASKSTATUSID", "task_status", listitem_lookup)
     df = add_listitem_fields(df, "SOURCETYPEID", "source_module", listitem_lookup)
@@ -293,24 +286,14 @@ def build_task_events(data_dir: Path, location_dim: pd.DataFrame, listitem_looku
     completion_date = coalesce_datetime(df, ["COMPLETIONDATE", "MARKEDCOMPLETEDATE"])
     status = df.get("task_status_item", pd.Series("", index=df.index)).map(clean_text_value)
     status_lower = status.str.lower()
-    is_open_task = ~status_lower.isin(["closed", "deleted"]) & completion_date.isna()
+    is_open_task = ~status_lower.isin(["closed", "deleted", "complete", "completed"]) & completion_date.isna()
     today = pd.Timestamp.utcnow().tz_localize(None).normalize()
     is_overdue_task = is_open_task & due_date.notna() & (due_date < today)
     category = df.get("task_category_item", pd.Series("Task", index=df.index)).map(clean_text_value)
     module = df.get("source_module_item", pd.Series("", index=df.index)).map(clean_text_value)
     source_subtype = np.where(module.ne(""), category + " - " + module, category)
-
-    text_fields = [
-        "TASK",
-        "DESCRIPTION",
-        "BESTPRACTICES",
-        "VERIFICATIONREASON",
-        "SOURCE",
-        "EQUIPMENT",
-        "OTHERLOCATIONNAME",
-    ]
-    clean_text = make_text_block(df, text_fields)
-    out = pd.DataFrame({
+    text_fields = ["TASK", "DESCRIPTION", "BESTPRACTICES", "VERIFICATIONREASON", "SOURCE", "EQUIPMENT", "OTHERLOCATIONNAME"]
+    return pd.DataFrame({
         "event_id": "task_" + df["TASKID"].astype(str),
         "source_type": "task",
         "source_subtype": source_subtype,
@@ -322,7 +305,7 @@ def build_task_events(data_dir: Path, location_dim: pd.DataFrame, listitem_looku
         "location_path": df.get("location_path_clean", df.get("location_path", "")),
         "title": coalesce_string(df, ["TASK", "TASKNUMBER"]),
         "description": coalesce_string(df, ["DESCRIPTION"]),
-        "clean_text": clean_text,
+        "clean_text": make_text_block(df, text_fields),
         "status": status,
         "category": category,
         "task_source_module": module,
@@ -342,17 +325,16 @@ def build_task_events(data_dir: Path, location_dim: pd.DataFrame, listitem_looku
         "raw_category_id": df.get("TASKCATEGORYID"),
         "raw_source_type_id": df.get("SOURCETYPEID"),
     })
-    return out
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Build unified safety text event table from incident, audit, task, injury, location, and list item CSV files.")
-    parser.add_argument("--data-dir", default=cfg.DATA_DIR)
-    parser.add_argument("--output-dir", default=cfg.STEP_00_DIR)
-    parser.add_argument("--sample-size", type=int, default=cfg.SAMPLE_SIZE, help="Optional rows per main source table for testing.")
-    parser.add_argument("--drop-empty-text", action="store_true", default=cfg.DROP_EMPTY_TEXT, help="Drop records with empty clean_text.")
+    parser.add_argument("--data-dir", default=cfg_value("DATA_DIR", PROJECT_ROOT / "data" / "raw"))
+    parser.add_argument("--output-dir", default=cfg_value("STEP_00_DIR", PROJECT_ROOT / "outputs" / "step_00_unified_text_events"))
+    parser.add_argument("--sample-size", type=int, default=cfg_value("SAMPLE_SIZE", None), help="Optional rows per main source table for testing.")
+    parser.add_argument("--drop-empty-text", action="store_true", default=cfg_value("DROP_EMPTY_TEXT", False), help="Drop records with empty clean_text.")
     parser.add_argument("--keep-empty-text", dest="drop_empty_text", action="store_false", help="Keep records with empty clean_text.")
-    parser.add_argument("--english-only", action="store_true", default=cfg.ENGLISH_ONLY_TEXT_FILTER, help="Keep only records detected as English by the configured language detection library.")
+    parser.add_argument("--english-only", action="store_true", default=cfg_value("ENGLISH_ONLY_TEXT_FILTER", False), help="Keep only records detected as English.")
     parser.add_argument("--keep-all-languages", dest="english_only", action="store_false", help="Disable English-only language filtering.")
     args = parser.parse_args()
 
@@ -361,6 +343,7 @@ def main():
     output_dir = ensure_dir(args.output_dir)
     log("Starting unified safety text event build.", start_time)
     log(f"Data directory: {data_dir}", start_time)
+
     lookup, _ = load_listitem_lookup(data_dir / "LISTITEM_VIEW.csv")
     location_dim = build_location_hierarchy(data_dir / "LOCATION_VIEW.csv", lookup)
     save_csv(location_dim, output_dir / "location_hierarchy.csv")
@@ -373,6 +356,7 @@ def main():
     ]
     events = pd.concat(frames, ignore_index=True, sort=False)
     log(f"Combined source events: {len(events):,} rows before text/language filtering.", start_time)
+
     events["event_date"] = parse_datetime_series(events["event_date"])
     events["due_date"] = parse_datetime_series(events["due_date"])
     events["completion_date"] = parse_datetime_series(events["completion_date"])
@@ -387,7 +371,7 @@ def main():
 
     language_summary = {
         "english_only_filter_enabled": bool(args.english_only),
-        "language_detection_library": getattr(cfg, "LANGUAGE_DETECTION_LIBRARY", "langdetect"),
+        "language_detection_library": cfg_value("LANGUAGE_DETECTION_LIBRARY", "langdetect"),
     }
     if args.english_only:
         before_language_filter = int(len(events))
@@ -400,12 +384,10 @@ def main():
         filtered_out = events.loc[~keep_mask].copy()
         if len(filtered_out) > 0:
             save_csv(
-                filtered_out[[
-                    c for c in [
-                        "event_id", "source_type", "source_subtype", "source_id", "detected_language",
-                        "detected_language_score", "language_detection_status", "title", "description", "clean_text"
-                    ] if c in filtered_out.columns
-                ]].head(10000),
+                filtered_out[[c for c in [
+                    "event_id", "source_type", "source_subtype", "source_id", "detected_language",
+                    "detected_language_score", "language_detection_status", "title", "description", "clean_text",
+                ] if c in filtered_out.columns]].head(10000),
                 output_dir / "non_english_filtered_sample.csv.gz",
             )
         events = events.loc[keep_mask].copy()
@@ -416,11 +398,11 @@ def main():
             "pct_removed_by_language_filter": float((before_language_filter - len(events)) / before_language_filter) if before_language_filter else 0.0,
             "detected_language_counts_before_filter": language_counts,
             "language_detection_status_counts_before_filter": language_status_counts,
-            "language_detection_min_prob": getattr(cfg, "LANGUAGE_DETECTION_MIN_PROB", None),
-            "language_detection_min_text_chars": getattr(cfg, "LANGUAGE_DETECTION_MIN_TEXT_CHARS", None),
-            "language_detection_max_text_chars": getattr(cfg, "LANGUAGE_DETECTION_MAX_TEXT_CHARS", None),
-            "english_only_keep_short_text": getattr(cfg, "ENGLISH_ONLY_KEEP_SHORT_TEXT", None),
-            "english_only_keep_unknown_language": getattr(cfg, "ENGLISH_ONLY_KEEP_UNKNOWN_LANGUAGE", None),
+            "language_detection_min_prob": cfg_value("LANGUAGE_DETECTION_MIN_PROB", None),
+            "language_detection_min_text_chars": cfg_value("LANGUAGE_DETECTION_MIN_TEXT_CHARS", None),
+            "language_detection_max_text_chars": cfg_value("LANGUAGE_DETECTION_MAX_TEXT_CHARS", None),
+            "english_only_keep_short_text": cfg_value("ENGLISH_ONLY_KEEP_SHORT_TEXT", None),
+            "english_only_keep_unknown_language": cfg_value("ENGLISH_ONLY_KEEP_UNKNOWN_LANGUAGE", None),
             "non_english_filtered_sample_path": str(output_dir / "non_english_filtered_sample.csv.gz"),
         })
         log(f"English-only filter removed {before_language_filter - len(events):,} rows; kept {len(events):,} rows.", start_time)
@@ -434,10 +416,16 @@ def main():
     events = events.drop_duplicates(subset=["event_id"]).reset_index(drop=True)
     log(f"Dropped duplicate event IDs: {before_dedup - len(events):,}.", start_time)
 
+    events = ensure_unified_event_schema(events)
+    missing = [c for c in OUTPUT_COLUMNS if c not in events.columns]
+    if missing:
+        raise RuntimeError(f"Output schema enforcement failed. Missing columns: {missing}")
+
     output_path = output_dir / "safety_text_event.csv.gz"
     save_csv(events, output_path)
     summary = {
         "output_path": str(output_path),
+        "schema_columns": OUTPUT_COLUMNS,
         "row_count": int(len(events)),
         "source_type_counts": events["source_type"].value_counts(dropna=False).to_dict(),
         "date_min": str(events["event_date"].min()),

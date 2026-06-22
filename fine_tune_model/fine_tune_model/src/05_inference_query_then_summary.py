@@ -236,6 +236,22 @@ def render_template(template: str, case: Dict[str, Any], model_output: str = "",
         raise KeyError(f"Prompt template uses unknown placeholder {e}. Supported placeholders: {sorted(values.keys())}")
 
 
+def extract_field_from_prompt(user_text: str, field_name: str, default: str = "unknown") -> str:
+    """Extract one metadata field from the prepared user prompt.
+
+    Prepared records store site/department inside the user message created by
+    01_prepare_data.py. Older prepared JSONL files do not include those fields
+    in metadata, so inference sampling must recover them from the prompt.
+    """
+    if not user_text:
+        return default
+    pattern = rf"(?im)^\s*{re.escape(field_name)}\s*:\s*(.*?)\s*$"
+    match = re.search(pattern, user_text)
+    if not match:
+        return default
+    return safe_text(match.group(1), default)
+
+
 def get_case_from_prepared_row(row: Dict[str, Any], fallback_id: str) -> Optional[Dict[str, Any]]:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     messages = row.get("messages") if isinstance(row.get("messages"), list) else []
@@ -248,18 +264,43 @@ def get_case_from_prepared_row(row: Dict[str, Any], fallback_id: str) -> Optiona
         return None
 
     # Try to recover the actual description from the prepared user prompt.
-    desc_match = re.search(r"description:\s*(.*)", user_text, flags=re.DOTALL | re.IGNORECASE)
+    desc_match = re.search(r"(?im)^\s*description\s*:\s*(.*)", user_text, flags=re.DOTALL)
     description = desc_match.group(1).strip() if desc_match else user_text
     description = re.sub(r"\n+\s*Return .*", "", description, flags=re.IGNORECASE | re.DOTALL).strip()
     if len(description) < 20:
         description = user_text
 
-    case_id = safe_text(metadata.get("event_id") or metadata.get("record_id"), fallback_id)
+    # Backward-compatible metadata recovery:
+    # - Newer prepared rows may have these fields directly in metadata.
+    # - Older prepared rows usually have them only in the user prompt.
+    case_id = safe_text(
+        metadata.get("event_id")
+        or metadata.get("record_id")
+        or extract_field_from_prompt(user_text, "event_id", ""),
+        fallback_id,
+    )
+    source_type = safe_text(
+        metadata.get("source_type") or extract_field_from_prompt(user_text, "source_type", ""),
+        "unknown",
+    )
+    site = safe_text(
+        metadata.get("site")
+        or metadata.get("location")
+        or extract_field_from_prompt(user_text, "site", ""),
+        "unknown",
+    )
+    department = safe_text(
+        metadata.get("department")
+        or metadata.get("dept")
+        or extract_field_from_prompt(user_text, "department", ""),
+        "unknown",
+    )
+
     return {
         "case_id": case_id,
-        "source_type": safe_text(metadata.get("source_type"), "unknown"),
-        "site": safe_text(metadata.get("site") or metadata.get("location"), "unknown"),
-        "department": safe_text(metadata.get("department"), "unknown"),
+        "source_type": source_type,
+        "site": site,
+        "department": department,
         "description": description,
         "sample_source": "prepared",
     }

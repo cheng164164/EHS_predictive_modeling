@@ -22,7 +22,7 @@ from pathlib import Path
 THIS_FILE = Path(__file__).resolve()
 # config.py path: pattern_learning_project/src/audits_tasks_modeling/config.py
 PROJECT_ROOT = THIS_FILE.parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "data"/ "raw"
 OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "audits_tasks_modeling"
 
 # Existing Step 00 unified table output folder.
