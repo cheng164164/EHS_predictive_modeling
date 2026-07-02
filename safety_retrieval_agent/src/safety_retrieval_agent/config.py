@@ -615,13 +615,27 @@ class Settings:
         return self.output_dir / "data"
 
     def local_runtime_artifacts_available(self) -> bool:
-        """Return True when the local cache has enough files for agent runtime."""
-        return (
+        """Return True when enough local files exist for agent runtime.
+
+        Accept either the dedicated local runtime cache layout
+        (indexes/faiss_indexes and indexes/bm25_indexes) or the standard 01b
+        build layout (faiss_indexes and bm25_indexes). This lets you run
+        scripts/01b_build_indexes_from_chunks.py locally and then run script 02
+        immediately without copying artifacts into a separate cache folder.
+        """
+        standard_build_available = (
+            self.indexes_dir().exists()
+            and self.bm25_dir().exists()
+            and self.models_dir().exists()
+            and (self.enriched_knowledge_base_path().exists() or self.knowledge_base_path().exists())
+        )
+        cache_available = (
             self.local_runtime_faiss_indexes_dir().exists()
             and self.local_runtime_bm25_indexes_dir().exists()
             and self.local_runtime_models_dir().exists()
             and self.local_runtime_data_dir().exists()
         )
+        return bool(standard_build_available or cache_available)
 
     def use_local_runtime_artifacts(self) -> bool:
         mode = str(self.artifact_read_mode or "auto").strip().lower()
@@ -666,12 +680,12 @@ class Settings:
 
     def artifact_indexes_dir(self) -> str | Path:
         if self.use_local_runtime_artifacts():
-            return self.local_runtime_faiss_indexes_dir()
+            return self.indexes_dir() if self.indexes_dir().exists() else self.local_runtime_faiss_indexes_dir()
         return self.artifact_path("faiss_indexes")
 
     def artifact_bm25_dir(self) -> str | Path:
         if self.use_local_runtime_artifacts():
-            return self.local_runtime_bm25_indexes_dir()
+            return self.bm25_dir() if self.bm25_dir().exists() else self.local_runtime_bm25_indexes_dir()
         return self.artifact_path("bm25_indexes")
 
     def artifact_models_dir(self) -> str | Path:

@@ -24,6 +24,7 @@ from .config import Settings
 from .embedding import TextEmbedder
 from .faiss_store import build_and_save_subset_index
 from .theme import build_theme_profiles, discover_themes, save_theme_model
+from .artifact_io import artifact_exists, artifact_join, load_numpy, read_json as read_artifact_json
 from .utils import clean_text_value, ensure_dir, load_json, save_json, word_count
 
 
@@ -38,6 +39,38 @@ def embedding_shape_path(settings: Settings) -> Path:
 def embedding_metadata_path(settings: Settings) -> Path:
     return settings.embeddings_dir() / "embedding_model_metadata.json"
 
+
+
+
+def _datastore_embeddings_dir_for_merge(settings: Settings) -> str | Path | None:
+    """Return the remote datastore embeddings directory for 01b merge reads.
+
+    Do not use settings.artifact_embeddings_dir() here. In auto mode, that
+    method intentionally switches to local runtime artifacts when local outputs
+    exist. For the 01b rebuild workflow we often want local updated data/scope
+    files while reading only the heavy embedding artifacts from the Azure ML
+    datastore. Therefore this function uses artifact_azureml_uri directly.
+    """
+    base = clean_text_value(getattr(settings, "artifact_azureml_uri", ""))
+    if base and base.startswith(("azureml://", "abfss://", "wasbs://", "https://")):
+        return artifact_join(base.rstrip("/"), "embeddings")
+    return None
+
+
+def datastore_embedding_metadata_path(settings: Settings) -> str | Path | None:
+    """Return the configured remote embedding metadata path, when available."""
+    remote_embeddings = _datastore_embeddings_dir_for_merge(settings)
+    if remote_embeddings is not None:
+        return artifact_join(remote_embeddings, "embedding_model_metadata.json")
+    return None
+
+
+def datastore_chunk_file_path(settings: Settings, chunk_index: int) -> str | Path | None:
+    """Return the configured remote embedding chunk path, when available."""
+    remote_embeddings = _datastore_embeddings_dir_for_merge(settings)
+    if remote_embeddings is not None:
+        return artifact_join(remote_embeddings, "chunks", f"chunk_{int(chunk_index):05d}.npy")
+    return None
 
 def embedding_scope_sample_path(settings: Settings) -> Path:
     return settings.embedding_scope_path().with_name("safety_embedding_scope_sample.csv")
@@ -217,6 +250,40 @@ def _load_existing_embedding_metadata(settings: Settings) -> dict | None:
         except Exception:
             return None
     return None
+
+
+def _load_embedding_metadata_for_merge(settings: Settings) -> tuple[dict | None, str | Path | None]:
+    """Load embedding metadata for 01b.
+
+    01b may be run locally with updated local data/scope files while the heavy
+    embedding chunks remain in the Azure ML datastore. Prefer the local metadata
+    when present; otherwise read the configured datastore/runtime artifact path.
+    """
+    local_path = embedding_metadata_path(settings)
+    if local_path.exists():
+        try:
+            return load_json(local_path), local_path
+        except Exception:
+            pass
+
+    remote_path = datastore_embedding_metadata_path(settings)
+    if remote_path is not None and artifact_exists(remote_path):
+        try:
+            return read_artifact_json(remote_path), remote_path
+        except Exception:
+            pass
+    return None, None
+
+
+def _resolve_chunk_file_for_read(settings: Settings, chunk_index: int) -> str | Path:
+    """Return local chunk path when present, otherwise datastore chunk path."""
+    local_path = chunk_file_path(settings, chunk_index)
+    if local_path.exists():
+        return local_path
+    remote_path = datastore_chunk_file_path(settings, chunk_index)
+    if remote_path is not None and artifact_exists(remote_path):
+        return remote_path
+    return local_path
 
 
 def _existing_chunk_ok(path: Path, expected_rows: int, expected_dim: int | None = None) -> bool:
@@ -436,37 +503,54 @@ def merge_embedding_chunks(settings: Settings, records: pd.DataFrame | None = No
     if records is None:
         records, _ = load_or_create_embedding_scope(settings)
     chunks = chunk_ranges_by_index(len(records), int(settings.embedding_chunk_size))
-    metadata = _load_existing_embedding_metadata(settings)
+    metadata, metadata_source = _load_embedding_metadata_for_merge(settings)
     if not metadata:
-        raise FileNotFoundError(f"Embedding metadata not found: {embedding_metadata_path(settings)}")
+        remote_path = datastore_embedding_metadata_path(settings)
+        raise FileNotFoundError(
+            "Embedding metadata not found locally or in the configured datastore artifact root. "
+            f"Checked local: {embedding_metadata_path(settings)}; remote: {remote_path}. "
+            "Set SAFETY_RETRIEVAL_ARTIFACT_AZUREML_URI to the managed-batch-artifacts folder if needed."
+        )
+    print(f"[Merge] Loaded embedding metadata from: {metadata_source}", flush=True)
+
     dim = int(metadata.get("embedding_dimension") or 0)
     if dim <= 0:
-        # Infer from first chunk.
+        # Infer from first available local or datastore chunk.
         for ch in chunks:
-            path = chunk_file_path(settings, ch["chunk_index"])
-            if path.exists():
-                dim = int(np.load(path, mmap_mode="r").shape[1])
+            path = _resolve_chunk_file_for_read(settings, ch["chunk_index"])
+            if artifact_exists(path):
+                arr = load_numpy(path, allow_pickle=False)
+                dim = int(arr.shape[1])
                 break
     if dim <= 0:
         raise ValueError("Could not determine embedding dimension from metadata or chunks.")
 
     missing = []
     for ch in chunks:
-        path = chunk_file_path(settings, ch["chunk_index"])
-        if not _existing_chunk_ok(path, ch["n_records"], dim):
+        path = _resolve_chunk_file_for_read(settings, ch["chunk_index"])
+        if not artifact_exists(path):
             missing.append({**ch, "chunk_file": str(path)})
     if missing:
         if bool(settings.fail_if_embedding_chunks_incomplete):
-            raise RuntimeError(f"Cannot merge embeddings: {len(missing)} chunks are missing/incomplete. First missing: {missing[:3]}")
-        print(f"[Merge] Warning: {len(missing)} chunks are missing/incomplete.", flush=True)
+            raise RuntimeError(f"Cannot merge embeddings: {len(missing)} chunks are missing. First missing: {missing[:3]}")
+        print(f"[Merge] Warning: {len(missing)} chunks are missing.", flush=True)
 
     ensure_dir(settings.embeddings_dir())
     out = np.lib.format.open_memmap(embedding_path(settings), mode="w+", dtype="float32", shape=(len(records), dim))
     for ch in chunks:
-        path = chunk_file_path(settings, ch["chunk_index"])
-        arr = np.load(path, mmap_mode="r")
-        out[int(ch["start_row"]):int(ch["end_row"])] = arr
-        print(f"[Merge] Copied chunk {int(ch['chunk_index']):05d} rows={int(ch['start_row']):,}:{int(ch['end_row']):,}", flush=True)
+        path = _resolve_chunk_file_for_read(settings, ch["chunk_index"])
+        arr = load_numpy(path, allow_pickle=False)
+        expected_rows = int(ch["n_records"])
+        if arr.ndim != 2 or int(arr.shape[0]) != expected_rows or int(arr.shape[1]) != dim:
+            raise RuntimeError(
+                f"Chunk {int(ch['chunk_index']):05d} has shape {getattr(arr, 'shape', None)}, "
+                f"expected ({expected_rows}, {dim}). Source: {path}"
+            )
+        out[int(ch["start_row"]):int(ch["end_row"])] = arr.astype("float32", copy=False)
+        print(
+            f"[Merge] Copied chunk {int(ch['chunk_index']):05d} rows={int(ch['start_row']):,}:{int(ch['end_row']):,} from {path}",
+            flush=True,
+        )
     out.flush()
     np.save(embedding_shape_path(settings), np.array([len(records), dim], dtype="int64"))
     metadata.update(
@@ -475,6 +559,7 @@ def merge_embedding_chunks(settings: Settings, records: pd.DataFrame | None = No
             "embedding_shape": [int(len(records)), int(dim)],
             "embedding_file": str(embedding_path(settings)),
             "embedding_shape_file": str(embedding_shape_path(settings)),
+            "embedding_metadata_source": str(metadata_source),
             "merged_from_chunks": True,
         }
     )
